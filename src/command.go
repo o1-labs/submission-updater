@@ -157,22 +157,106 @@ func partitionSubmissionsByCutover(submissions []Submission, cutover time.Time) 
 	return preFork, postFork
 }
 
-// sokMismatchError is the verifier's message for a snark-work sok-digest
-// mismatch. The verifier has always enforced the binding; mainnet never saw
-// it fail only because pre-3.4.0 daemons never route uptime snark work
-// through the zkApp-segment path that stamps the default sok digest into the
-// statement (MinaProtocol/mina#19299) - a path the released Mesa daemons all
-// carry. The binding prevents fee/prover misattribution in the snark pool,
-// where work is paid; uptime snark work is never pooled or paid, so the
-// mismatch can be waived via TOLERATE_SOK_MISMATCH until the daemon fix
-// (MinaProtocol/mina#19313) is deployed fleet-wide.
-const sokMismatchError = "sok message digest does not match the sok message"
+// sokMismatchErrors are the verifier's messages for a snark-work sok-digest
+// mismatch. There are two spellings because the check lives in a different
+// place in each era, and a deployment spanning the hard fork sees both:
+//
+//   - Pre-fork binaries (Berkeley, and the 3.5.0 mainnet stop-slot release)
+//     do the comparison inside Transaction_snark.verify, which reports
+//     "Transaction_snark.verify: Mismatched sok_message" - underscored, and
+//     with no "digest" in it.
+//   - Post-fork binaries (4.0.0 Mesa) moved it to an explicit check in
+//     delegation_verify.ml, which reports "proof's sok message digest does
+//     not match the sok message".
+//
+// Matching only the post-fork wording would leave the waiver inert against
+// everything failing on mainnet today, and would still miss the pre-fork
+// partition after the fork.
+//
+// Daemons from 3.4.0 onward route uptime snark work through the zkApp-segment
+// path that stamps the default sok digest into the statement
+// (MinaProtocol/mina#19299); mainnet block producers are on 3.5.0 for the
+// stop slot, so the defect is live pre-fork as well. The binding prevents
+// fee/prover misattribution in the snark pool, where work is paid; uptime
+// snark work is never pooled or paid, so the mismatch can be waived via
+// TOLERATE_SOK_MISMATCH until the daemon fix (MinaProtocol/mina#19313) is
+// deployed fleet-wide.
+var sokMismatchErrors = []string{
+	// post-fork: delegation_verify's explicit check
+	"sok message digest does not match the sok message",
+	// pre-fork: Transaction_snark.verify's internal check
+	"Mismatched sok_message",
+}
+
+// isSokMismatch reports whether a validation error is a snark-work sok-digest
+// mismatch in either era's wording. The match is on a substring: the verifier
+// prefixes and decorates these messages with context.
+func isSokMismatch(validationError string) bool {
+	for _, candidate := range sokMismatchErrors {
+		if strings.Contains(validationError, candidate) {
+			return true
+		}
+	}
+	return false
+}
 
 // submissionKey identifies a submission across the verifier round trip. The
-// verifier echoes the fields it was given, so these two are carried both on the
-// batch we send and on the records we get back.
+// verifier echoes the fields it was given, so whichever of these is present on
+// the batch we send is also present on the records we get back.
+//
+// The Postgres reader populates ID from the row's primary key, which is unique;
+// the Cassandra reader does not populate it at all, so there the key falls back
+// to submission attributes. That fallback is NOT unique: a submitter can have
+// two rows with the same submitted_at (measured on the mainnet corpus, 338 of
+// 5,585 rows over six hours - 6.1% - share one). Callers must therefore treat a
+// key as identifying a GROUP of rows, never a single one; see keyedIndex.
 func submissionKey(submission Submission) string {
-	return submission.SubmittedAt.UTC().Format(time.RFC3339Nano) + "|" + submission.Submitter
+	if submission.ID != "" {
+		return "id|" + submission.ID
+	}
+	return "sub|" + submission.SubmittedAt.UTC().Format(time.RFC3339Nano) + "|" + submission.Submitter
+}
+
+// keyedIndex maps a submission key to every index that key covers, in the order
+// the records appeared. Duplicate keys are the reason this is a queue rather
+// than a single index: with map[string]int the last duplicate wins, two recovered
+// records overwrite the same slot, and the other row silently keeps its failing
+// verdict while the counter still reports it as recovered.
+type keyedIndex struct {
+	idx    map[string][]int
+	cursor map[string]int
+}
+
+func newKeyedIndex() *keyedIndex {
+	return &keyedIndex{idx: make(map[string][]int), cursor: make(map[string]int)}
+}
+
+func (k *keyedIndex) add(key string, i int) { k.idx[key] = append(k.idx[key], i) }
+
+func (k *keyedIndex) len() int {
+	n := 0
+	for _, v := range k.idx {
+		n += len(v)
+	}
+	return n
+}
+
+// take returns the next unclaimed index for key. Claiming in order pairs the
+// Nth record carrying a key with the Nth row carrying it, which is the right
+// correspondence because the verifier emits records in the order it was given
+// them. It reports false once a key's rows are exhausted, so extra records
+// cannot overwrite a row that was already updated.
+func (k *keyedIndex) take(key string) (int, bool) {
+	rows, ok := k.idx[key]
+	if !ok {
+		return 0, false
+	}
+	c := k.cursor[key]
+	if c >= len(rows) {
+		return 0, false
+	}
+	k.cursor[key] = c + 1
+	return rows[c], true
 }
 
 // retrySokMismatchesWithoutSnarkWork re-verifies submissions that failed only
@@ -191,13 +275,13 @@ func submissionKey(submission Submission) string {
 // The retry reuses the command of the pass that failed, so in dual-verifier
 // deployments each partition retries against its own binary and config.
 func (ctx *AppContext) retrySokMismatchesWithoutSnarkWork(cmd, command, input string, submissions []Submission) []Submission {
-	failedIdx := make(map[string]int)
+	failed := newKeyedIndex()
 	for i, submission := range submissions {
-		if strings.Contains(submission.ValidationError, sokMismatchError) {
-			failedIdx[submissionKey(submission)] = i
+		if isSokMismatch(submission.ValidationError) {
+			failed.add(submissionKey(submission), i)
 		}
 	}
-	if len(failedIdx) == 0 {
+	if failed.len() == 0 {
 		return submissions
 	}
 
@@ -205,13 +289,16 @@ func (ctx *AppContext) retrySokMismatchesWithoutSnarkWork(cmd, command, input st
 	// the retry batch has to be rebuilt from the submissions we sent.
 	var originals []Submission
 	if err := json.Unmarshal([]byte(input), &originals); err != nil {
-		ctx.Log.Errorf("Cannot retry %d sok-mismatch submission(s): unreadable verifier input: %v", len(failedIdx), err)
+		ctx.Log.Errorf("Cannot retry %d sok-mismatch submission(s): unreadable verifier input: %v", failed.len(), err)
 		return submissions
 	}
 
+	// retryRows[n] is the submissions index that retryBatch[n] came from, so the
+	// write-back never has to re-derive it from a key that may cover several rows.
 	var retryBatch []Submission
+	var retryRows []int
 	for _, original := range originals {
-		i, ok := failedIdx[submissionKey(original)]
+		i, ok := failed.take(submissionKey(original))
 		if !ok {
 			continue
 		}
@@ -221,10 +308,17 @@ func (ctx *AppContext) retrySokMismatchesWithoutSnarkWork(cmd, command, input st
 		// for the snark-work statement and goes on to verify the block.
 		original.SnarkWork = nil
 		retryBatch = append(retryBatch, original)
+		retryRows = append(retryRows, i)
 	}
 	if len(retryBatch) == 0 {
-		ctx.Log.Errorf("Cannot retry %d sok-mismatch submission(s): none matched the submissions sent to %v", len(failedIdx), command)
+		ctx.Log.Errorf("Cannot retry %d sok-mismatch submission(s): none matched the submissions sent to %v", failed.len(), command)
 		return submissions
+	}
+	if missed := failed.len() - len(retryBatch); missed > 0 {
+		// Not fatal - the rows we did match still get their retry - but it means
+		// some failing rows had no counterpart in the verifier input, which is
+		// not supposed to happen and would otherwise pass unnoticed.
+		ctx.Log.Errorf("%d sok-mismatch submission(s) had no counterpart in the verifier input and will keep their failing verdict", missed)
 	}
 
 	retryJSON, err := json.Marshal(retryBatch)
@@ -240,9 +334,16 @@ func (ctx *AppContext) retrySokMismatchesWithoutSnarkWork(cmd, command, input st
 		return submissions
 	}
 
-	verified := 0
+	// Claim rows from the batch we actually sent, so a key covering several rows
+	// hands each returned record its own row instead of overwriting one twice.
+	sent := newKeyedIndex()
+	for n, submission := range retryBatch {
+		sent.add(submissionKey(submission), retryRows[n])
+	}
+
+	verified, applied := 0, 0
 	for _, record := range retried {
-		i, ok := failedIdx[submissionKey(record)]
+		i, ok := sent.take(submissionKey(record))
 		if !ok {
 			ctx.Log.Errorf("Re-verification returned an unrecognised record for submitter %s, ignoring it", record.Submitter)
 			continue
@@ -256,8 +357,18 @@ func (ctx *AppContext) retrySokMismatchesWithoutSnarkWork(cmd, command, input st
 			verified++
 		}
 		submissions[i] = record
+		applied++
 	}
-	ctx.Log.Infof("Re-verified %d sok-mismatch submission(s) without snark work; %d now verified", len(retryBatch), verified)
+	// applied is the number of rows actually rewritten. It is reported separately
+	// from the batch size because they diverge exactly when something went wrong,
+	// and the earlier version of this code could report full success while leaving
+	// rows behind.
+	ctx.Log.Infof("Re-verified %d sok-mismatch submission(s) without snark work; %d row(s) updated, %d now verified",
+		len(retryBatch), applied, verified)
+	if applied < len(retryBatch) {
+		ctx.Log.Errorf("%d of %d retried submission(s) were not written back and keep their failing verdict",
+			len(retryBatch)-applied, len(retryBatch))
+	}
 
 	return submissions
 }

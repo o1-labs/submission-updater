@@ -570,9 +570,13 @@ func TestVerifySubmissionsIsolatesMalformedRecordToItsPartition(t *testing.T) {
 // empty payload delegation_verify produces when it short-circuits on an error:
 // no state_hash, parent, height or slot.
 const (
-	sokFailRecord   = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"sok message digest does not match the sok message"}`
-	cleanRecord     = `{"submitted_at":"2026-09-03T02:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62clean","block_hash":"hashClean","state_hash":"stateClean","verified":true}`
-	otherFailRecord = `{"submitted_at":"2026-09-03T03:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62other","block_hash":"hashOther","state_hash":"","verified":false,"validation_error":"invalid block proof"}`
+	// post-fork (4.0.0 Mesa): delegation_verify's explicit check
+	sokFailRecord = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
+	// pre-fork (Berkeley / 3.5.0 stop-slot): Transaction_snark.verify's
+	// internal check, reported with its own prefix and wording
+	sokFailRecordPreFork = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	cleanRecord          = `{"submitted_at":"2026-09-03T02:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62clean","block_hash":"hashClean","state_hash":"stateClean","verified":true}`
+	otherFailRecord      = `{"submitted_at":"2026-09-03T03:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62other","block_hash":"hashOther","state_hash":"","verified":false,"validation_error":"invalid block proof"}`
 
 	// What the retry returns once the snark work is gone: the block verified on
 	// its own, so the payload is complete.
@@ -654,13 +658,79 @@ func stubInvocations(t *testing.T, countFile string) int {
 	return n
 }
 
+func TestIsSokMismatch(t *testing.T) {
+	// The check moved between eras, so the waiver has to recognise both
+	// spellings; anything else must stay untouched.
+	testCases := []struct {
+		name            string
+		validationError string
+		want            bool
+	}{
+		{
+			name:            "post-fork explicit check",
+			validationError: "proof's sok message digest does not match the sok message",
+			want:            true,
+		},
+		{
+			name:            "pre-fork Transaction_snark.verify check",
+			validationError: "Transaction_snark.verify: Mismatched sok_message",
+			want:            true,
+		},
+		{
+			name:            "pre-fork wording with trailing context",
+			validationError: "Transaction_snark.verify: Mismatched sok_message (statement 3)",
+			want:            true,
+		},
+		{
+			name:            "unrelated failure",
+			validationError: "invalid block proof",
+			want:            false,
+		},
+		{
+			name:            "no failure",
+			validationError: "",
+			want:            false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSokMismatch(tc.validationError); got != tc.want {
+				t.Errorf("isSokMismatch(%q) = %v, want %v", tc.validationError, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunDelegationVerifyCommandRetriesSokMismatchWithoutSnarkWork(t *testing.T) {
 	// The point of the retry: a tolerated submission has to come back with a
 	// real payload. Marking the short-circuited record verified would leave
 	// state_hash empty, and the coordinator drops NULL state hashes before it
 	// awards points - so such a submission would score zero either way.
+	//
+	// Both era spellings have to travel this path: the pre-fork binaries in
+	// use on mainnet today report the mismatch from inside
+	// Transaction_snark.verify, the post-fork ones from delegation_verify.
+	testCases := []struct {
+		name       string
+		failRecord string
+	}{
+		{name: "post-fork wording", failRecord: sokFailRecord},
+		{name: "pre-fork wording", failRecord: sokFailRecordPreFork},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertSokMismatchRetried(t, tc.failRecord)
+		})
+	}
+}
+
+func assertSokMismatchRetried(t *testing.T, failRecord string) {
+	t.Helper()
+
 	stub, countFile, stdinPrefix := writeStatefulStubVerifier(t,
-		[]string{sokFailRecord, cleanRecord, otherFailRecord},
+		[]string{failRecord, cleanRecord, otherFailRecord},
 		[]string{sokRetriedOKRecord},
 	)
 
@@ -744,10 +814,26 @@ func TestRunDelegationVerifyCommandKeepsRetryFailure(t *testing.T) {
 }
 
 func TestRunDelegationVerifyCommandKeepsSokMismatchWhenFlagOff(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failRecord string
+	}{
+		{name: "post-fork wording", failRecord: sokFailRecord},
+		{name: "pre-fork wording", failRecord: sokFailRecordPreFork},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertSokMismatchKeptWhenFlagOff(t, tc.failRecord)
+		})
+	}
+}
+
+func assertSokMismatchKeptWhenFlagOff(t *testing.T, failRecord string) {
+	t.Helper()
+
 	// With the flag off there is no retry at all: the verifier runs once and
 	// the sok failure stands like any other.
 	stub, countFile, _ := writeStatefulStubVerifier(t,
-		[]string{sokFailRecord, cleanRecord, otherFailRecord},
+		[]string{failRecord, cleanRecord, otherFailRecord},
 		[]string{sokRetriedOKRecord},
 	)
 
@@ -761,7 +847,7 @@ func TestRunDelegationVerifyCommandKeepsSokMismatchWhenFlagOff(t *testing.T) {
 	if len(submissions) != 3 {
 		t.Fatalf("got %d submissions, want 3 (%+v)", len(submissions), submissions)
 	}
-	if submissions[0].Verified || !strings.Contains(submissions[0].ValidationError, sokMismatchError) {
+	if submissions[0].Verified || !isSokMismatch(submissions[0].ValidationError) {
 		t.Errorf("sok-mismatch record should keep its failure, got verified=%v error=%q",
 			submissions[0].Verified, submissions[0].ValidationError)
 	}
@@ -793,5 +879,142 @@ func TestRunDelegationVerifyCommandSkipsRetryWithoutSokMismatch(t *testing.T) {
 	}
 	if len(submissions) != 2 {
 		t.Errorf("got %d submissions, want 2 (%+v)", len(submissions), submissions)
+	}
+}
+
+// Two rows a submitter produced at the same instant for the same block. This is
+// not hypothetical: on the mainnet corpus 338 of 5,585 rows over six hours (6.1%)
+// share a (submitted_at, submitter) pair, and in a live sink run 3 of 69
+// sok-failing rows sat in such a pair. Postgres gives these rows distinct ids;
+// Cassandra populates no id at all, so there they collapse onto one key.
+const (
+	dupFailRecord = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	dupOKRecord   = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
+
+	dupFailRecordID1 = `{"id":"1","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	dupFailRecordID2 = `{"id":"2","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	dupOKRecordID1   = `{"id":"1","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
+	dupOKRecordID2   = `{"id":"2","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
+)
+
+func dupTestBatch(t *testing.T, ids []string) string {
+	t.Helper()
+	submissions := make([]Submission, 2)
+	for i := range submissions {
+		submissions[i] = Submission{
+			SubmittedAt: time.Date(2026, 9, 3, 1, 0, 0, 0, time.UTC),
+			Submitter:   "B62dup",
+			BlockHash:   "hashDup",
+			SnarkWork:   []byte("snark"),
+		}
+		if ids != nil {
+			submissions[i].ID = ids[i]
+		}
+	}
+	batch, err := json.Marshal(submissions)
+	if err != nil {
+		t.Fatalf("marshaling duplicate batch: %v", err)
+	}
+	return string(batch)
+}
+
+func TestRunDelegationVerifyCommandRecoversEveryDuplicateKeyedRow(t *testing.T) {
+	// Regression: keying the retry on (submitted_at, submitter) alone let the
+	// last duplicate win, so both recovered records overwrote one slot and the
+	// other row silently kept its failing verdict - while the log still counted
+	// it as recovered. Every failing row must come back, in both storage shapes.
+	testCases := []struct {
+		name       string
+		ids        []string
+		failFirst  []string
+		retryLater []string
+	}{
+		{
+			name:       "postgres rows carry distinct ids",
+			ids:        []string{"1", "2"},
+			failFirst:  []string{dupFailRecordID1, dupFailRecordID2},
+			retryLater: []string{dupOKRecordID1, dupOKRecordID2},
+		},
+		{
+			name:       "cassandra rows carry no id and collapse onto one key",
+			ids:        nil,
+			failFirst:  []string{dupFailRecord, dupFailRecord},
+			retryLater: []string{dupOKRecord, dupOKRecord},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub, countFile, _ := writeStatefulStubVerifier(t, tc.failFirst, tc.retryLater)
+
+			appCtx := testAppContext()
+			appCtx.AppConfig.TolerateSokMismatch = true
+
+			submissions, err := appCtx.runDelegationVerifyCommand(stub, "", dupTestBatch(t, tc.ids))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := stubInvocations(t, countFile); got != 2 {
+				t.Fatalf("verifier invoked %d time(s), want 2 (first pass and retry)", got)
+			}
+			if len(submissions) != 2 {
+				t.Fatalf("got %d submissions, want 2 (%+v)", len(submissions), submissions)
+			}
+			for i, submission := range submissions {
+				if !submission.Verified || submission.ValidationError != "" {
+					t.Errorf("row %d was not recovered: verified=%v error=%q",
+						i, submission.Verified, submission.ValidationError)
+				}
+				// The payload is the whole point: a verified row with an empty
+				// state_hash still scores zero.
+				if submission.StateHash != "stateDup" {
+					t.Errorf("row %d lost the payload the coordinator scores on: state_hash=%q",
+						i, submission.StateHash)
+				}
+			}
+		})
+	}
+}
+
+func TestSubmissionKeySeparatesRowsSharingSubmitterAndTime(t *testing.T) {
+	at := time.Date(2026, 9, 3, 1, 0, 0, 0, time.UTC)
+	first := Submission{ID: "1", SubmittedAt: at, Submitter: "B62dup"}
+	second := Submission{ID: "2", SubmittedAt: at, Submitter: "B62dup"}
+	if submissionKey(first) == submissionKey(second) {
+		t.Errorf("rows with distinct ids must not share a key, both are %q", submissionKey(first))
+	}
+
+	// Without an id there is nothing left to tell them apart, which is why the
+	// index has to treat a key as covering a group of rows.
+	noID := Submission{SubmittedAt: at, Submitter: "B62dup"}
+	alsoNoID := Submission{SubmittedAt: at, Submitter: "B62dup"}
+	if submissionKey(noID) != submissionKey(alsoNoID) {
+		t.Errorf("id-less rows should fall back to the same key, got %q and %q",
+			submissionKey(noID), submissionKey(alsoNoID))
+	}
+}
+
+func TestKeyedIndexHandsOutEachRowOnce(t *testing.T) {
+	index := newKeyedIndex()
+	index.add("k", 4)
+	index.add("k", 9)
+	index.add("other", 1)
+
+	if index.len() != 3 {
+		t.Errorf("len() = %d, want 3 (it counts rows, not keys)", index.len())
+	}
+	if i, ok := index.take("k"); !ok || i != 4 {
+		t.Errorf("first take(k) = (%d, %v), want (4, true)", i, ok)
+	}
+	if i, ok := index.take("k"); !ok || i != 9 {
+		t.Errorf("second take(k) = (%d, %v), want (9, true)", i, ok)
+	}
+	// A third record carrying the same key has no row left to claim; letting it
+	// through would overwrite a row that was already updated.
+	if _, ok := index.take("k"); ok {
+		t.Error("third take(k) should report exhaustion")
+	}
+	if _, ok := index.take("absent"); ok {
+		t.Error("take on an unknown key should report false")
 	}
 }
