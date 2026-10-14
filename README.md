@@ -72,150 +72,36 @@ $ ./result/bin/cassandra-updater "2024-03-04 09:38:54.0+0000" "2024-03-04 09:45:
 
 ## Docker
 
-We can build docker image containing both `submission-updater` and [Stateless verifier tool](https://github.com/MinaProtocol/mina/tree/develop/src/app/delegation_verify). For that we need to feed build with `DUNE_PROFILE` and `MINA_BRANCH` env variables. `DUNE_PROFILE` is the profile in which the tool will be built (typically `devnet`). `MINA_BRANCH` indicates which branch of [Mina](https://github.com/MinaProtocol/mina) repository we want to build the tool from.
+`dockerfiles/Dockerfile-delegation-verify` builds `submission_updater` from `src/` and installs the [Stateless verifier tool](https://github.com/MinaProtocol/mina/tree/develop/src/app/delegation_verify) and the network config from a released Mina version in the signed apt repo (`stable.apt.packages.minaprotocol.com`, bookworm). Nothing is compiled from the Mina tree.
 
-The docker image already has set: 
- - `DELEGATION_VERIFY_BIN_PATH`
- - `SSL_CERTFILE` 
- - `GENESIS_LEDGER_FILE` with mainnet genesis_ledger file. In case different ledger file is required one can override it by passing GENESIS_LEDGER_FILE to the docker container via `-e GENESIS_LEDGER_FILE=/different/path/genesis.json`. 
- - `DELEGATION_VERIFY_BIN_PATH_POST_FORK`, `GENESIS_LEDGER_FILE_POST_FORK` and `FORK_CUTOVER_TIME` for dual-binary (pre/post-hard-fork) images — see below.
+Build args (env variables of `make docker-delegation-verify`):
+
+ - `MINA_VERSION` - required. Deb version of the Mina release, e.g. `4.0.2-84b8d96`. Installs `mina-delegation-verify` and `mina-<network>-config` at that version.
+ - `MINA_NETWORK` - default `mainnet`. Selects `mina-<network>-config`.
+ - `MINA_PROFILE` - default `MINA_NETWORK`. The verifier deb is profile-generic and reads it at run time.
+ - `LEDGER_CONFIG_VERSION` - default `MINA_VERSION`. Version of `mina-<network>-config` that ships the ledger tarballs. Config debs carry them from MinaProtocol/mina#19737 on. For 4.0.1 and 4.0.2 use `4.0.0-6850301`, which has the same mainnet ledgers.
+
+The verifier looks for the genesis and epoch ledgers under `/var/lib/coda` first and downloads them from S3 otherwise; files found locally are not hash-checked. The build therefore fails unless every `s3_data_hash` in `/var/lib/coda/<network>.json` matches a tarball in `/var/lib/coda`.
+
+The image sets:
+
+ - `DELEGATION_VERIFY_BIN_PATH` and `DELEGATION_VERIFY_BIN_PATH_POST_FORK` - both `/usr/local/bin/mina-delegation-verify`
+ - `GENESIS_LEDGER_FILE` and `GENESIS_LEDGER_FILE_POST_FORK` - both `/var/lib/coda/<network>.json`
+ - `MINA_PROFILE`, `SSL_CERTFILE`
+
+`FORK_CUTOVER_TIME` is not set. Dual-binary routing is still supported at run time: set `FORK_CUTOVER_TIME` and point the `*_POST_FORK` variables at a second binary and config.
 
 **Build**:
 
 ```
 $ nix-shell
-$ TAG=1.0 \
-  DUNE_PROFILE=devnet \
-  MINA_BRANCH=delegation_verify_over_stdin_rc_base \
+$ TAG=4.0.2 \
+  MINA_VERSION=4.0.2-84b8d96 \
+  LEDGER_CONFIG_VERSION=4.0.0-6850301 \
   make docker-delegation-verify
 ```
 
-### Dual-binary (pre/post-hard-fork) builds
-
-For the Mina "Mesa" hard fork a single image can carry **two** `delegation-verify` binaries — the pre-fork one (built from `MINA_BRANCH`, exactly as before) and a post-fork one. The post-fork build is controlled by three optional env variables (threaded through as docker build args):
-
- - `MINA_BRANCH_POST_FORK` - branch (or tagged release) of [Mina](https://github.com/MinaProtocol/mina) to build the post-fork binary from. **Empty (the default) disables the post-fork build entirely** and the resulting image is identical to a single-binary build (plus an empty placeholder file at the post-fork binary path).
- - `DUNE_PROFILE_POST_FORK` - dune profile for the post-fork build. **Defaults to `DUNE_PROFILE`**, so both binaries in one image are built on the same profile unless you deliberately override it.
- - `FORK_CUTOVER_TIME` - RFC3339 timestamp of the hard fork, baked into the image as the `FORK_CUTOVER_TIME` env variable. Empty (the default) keeps dual mode off — the wrapper behaves exactly as today.
-
-Passing `FORK_CUTOVER_TIME` *to the build* bakes an armed cutover into the image, so the build refuses to proceed unless the image can actually serve it: `MINA_BRANCH_POST_FORK` must be set, `genesis_ledgers/mainnet-post-fork.json` must exist, and the timestamp must parse (checked with GNU `date -d`; skipped on BSD/macOS `date`). This is the fork-day rebuild path. To arm an image you built earlier instead, leave it out here and set it at deploy time — see [Arming the cutover on an already-built image](#arming-the-cutover-on-an-already-built-image).
-
-The same three knobs are exposed as optional `workflow_dispatch` inputs of the Publish workflow (`mina_branch_post_fork`, `dune_profile_post_fork`, `fork_cutover_time`), as is `ledger_tarballs` (see below).
-
-Resulting image layout:
-
- - `/bin/delegation-verify` - pre-fork binary (`DELEGATION_VERIFY_BIN_PATH`)
- - `/bin/delegation-verify-post-fork` - post-fork binary (`DELEGATION_VERIFY_BIN_PATH_POST_FORK`)
- - `/root/genesis_ledgers/mainnet.json` - pre-fork config file (`GENESIS_LEDGER_FILE`)
- - `/root/genesis_ledgers/mainnet-post-fork.json` - post-fork config file (`GENESIS_LEDGER_FILE_POST_FORK`)
-
-The whole `genesis_ledgers/` directory is copied into the image, so `mainnet-post-fork.json` rides along automatically if it is committed *before* the build. Usually it will not be: that file carries a `proof.fork` block (`state_hash`, `blockchain_length`, `global_slot_since_genesis`) describing the actual fork block, so it cannot exist until the fork has happened. An image built ahead of the fork therefore ships without it, and the post-fork ledger has to be supplied at deploy time instead — see [Arming the cutover on an already-built image](#arming-the-cutover-on-an-already-built-image) below.
-
-Until the cutover is armed, dual-binary images can already be built and deployed with `FORK_CUTOVER_TIME` unset, in which case only the pre-fork binary is used.
-
-Example dual-binary build:
-
-```
-$ nix-shell
-$ TAG=1.0 \
-  DUNE_PROFILE=devnet \
-  MINA_BRANCH=delegation_verify_over_stdin_rc_base \
-  MINA_BRANCH_POST_FORK=mesa \
-  FORK_CUTOVER_TIME=2026-09-03T00:00:00Z \
-  make docker-delegation-verify
-```
-
-Both binaries above are built on the `devnet` profile: `DUNE_PROFILE_POST_FORK` is unset and therefore inherits `DUNE_PROFILE`.
-
-### Baking ledger tarballs into the image
-
-`delegation-verify` needs the genesis ledger and both epoch ledgers named in its config. It looks for them as tarballs under `/var/lib/coda` first and, failing that, downloads them from S3 into `/tmp/s3_cache_dir` (`src/lib/cache_dir` in Mina). The coordinator starts every worker as a fresh Job, so nothing in `/tmp` survives between runs and each worker re-downloads the full set — ~285 MB for the mainnet Mesa ledgers, ~270 GB/day of S3 egress at 12 workers every 20 minutes.
-
-`LEDGER_TARBALLS` pre-fetches the tarballs at build time and places them under `/var/lib/coda`, so the verifier never reaches S3. It is a whitespace-separated list of `<filename>=<sha3-256>`:
-
- - `<filename>` is the S3 object name the verifier would download (`genesis_ledger_<hash>.tar.gz`, `epoch_ledger_<hash>.tar.gz`). The quickest way to get them is the verifier's own trace log, or the S3 access log of the bucket.
- - `<sha3-256>` is the matching `s3_data_hash` from the runtime config (`ledger.s3_data_hash`, `epoch_data.staking.s3_data_hash`, `epoch_data.next.s3_data_hash`).
-
-The build fails on any hash mismatch. This check matters: the verifier only verifies the hash of a file it downloads itself, a file found under `/var/lib/coda` is trusted as is. `LEDGER_BUCKET_URL` (default `https://s3-us-west-2.amazonaws.com/snark-keys-ro.o1test.net`) is where the tarballs are fetched from at build time. Empty `LEDGER_TARBALLS` (the default) leaves the image as before: an empty `/var/lib/coda` and download at run time.
-
-Example for mainnet Mesa (post-fork config as of September 2026):
-
-```
-LEDGER_TARBALLS="genesis_ledger_8f90b767376bb0196dc19cad67793299d5d51691c446e512b246ca5d8259e00d.tar.gz=68f5a0c1f32ccc36e8c13f9d6b38a2de5d82155887752b795bf2d60cbed441a1 \
-epoch_ledger_7ceaa1961cbb1630f98cbb17ac8fe04aeeadbe7b72b302d09789537b15474f3d.tar.gz=d32def351368bd72331a85822f06c42e888c58790c7481748fe38e4ffa509d7b \
-epoch_ledger_cd423fcdf17f7aeb5db014e4782756ecd12b9e5ac31c3201f3023e8cc9721d71.tar.gz=39ffe8728842e772de3c7d647f430bab52170ff86919f84ef4e8dbe3b358e493"
-```
-
-The same list is the optional `ledger_tarballs` input of the Publish workflow. The ledgers belong to one fork config, so a config change (new `s3_data_hash`) needs a rebuild with the new list; a stale list is harmless, the verifier simply falls back to S3 for the files it does not find.
-
-### Arming the cutover on an already-built image
-
-This is the sequence the dual-binary image exists for: build and deploy *before* the fork, arm *after* it, with no rebuild or image swap on fork day.
-
-Setting `FORK_CUTOVER_TIME` is not sufficient on its own. The routing wrapper stats **both** the post-fork binary and the post-fork genesis ledger at startup and exits if either is missing, so arming an image that was built before the ledger existed fails immediately with something like:
-
-```
-GENESIS_LEDGER_FILE_POST_FORK: cannot stat /root/genesis_ledgers/mainnet-post-fork.json
-```
-
-The binary is already in the image (it was built from `MINA_BRANCH_POST_FORK`). The ledger is not, and could not have been — see above — so mount it in at deploy time.
-
-**Docker**, mounting at the path already baked into the image, so no env override is needed:
-
-```
-docker run --rm \
-  -e FORK_CUTOVER_TIME=2026-09-03T00:00:00Z \
-  -v /path/to/mainnet-post-fork.json:/root/genesis_ledgers/mainnet-post-fork.json:ro \
-  ghcr.io/o1-labs/submission-updater:1.0 \
-  "2026-09-03 00:00:00.0+0000" "2026-09-03 00:05:00.0+0000"
-```
-
-Or mount it anywhere and point the variable at it:
-
-```
-docker run --rm \
-  -e FORK_CUTOVER_TIME=2026-09-03T00:00:00Z \
-  -e GENESIS_LEDGER_FILE_POST_FORK=/mnt/ledgers/mainnet-post-fork.json \
-  -v /path/to/ledgers:/mnt/ledgers:ro \
-  ghcr.io/o1-labs/submission-updater:1.0 \
-  "2026-09-03 00:00:00.0+0000" "2026-09-03 00:05:00.0+0000"
-```
-
-**Kubernetes**. The ledger file is small — it references ledger data by hash rather than inlining it, so the committed `mainnet.json` is under 1 kB — which makes a ConfigMap a comfortable fit:
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mina-post-fork-ledger
-data:
-  mainnet-post-fork.json: |
-    { ... contents of the published post-fork genesis ledger ... }
-```
-
-Mounted on the worker Job/pod spec:
-
-```yaml
-spec:
-  containers:
-    - name: submission-updater
-      env:
-        - name: FORK_CUTOVER_TIME
-          value: "2026-09-03T00:00:00Z"
-      volumeMounts:
-        - name: post-fork-ledger
-          mountPath: /root/genesis_ledgers/mainnet-post-fork.json
-          subPath: mainnet-post-fork.json
-          readOnly: true
-  volumes:
-    - name: post-fork-ledger
-      configMap:
-        name: mina-post-fork-ledger
-```
-
-`subPath` mounts the single file without shadowing the rest of `/root/genesis_ledgers/`, so the pre-fork `mainnet.json` baked into the image stays visible. Swap the ConfigMap for a Secret if the ledger should be treated as sensitive — the volume wiring is unchanged.
-
-This is also why building with `MINA_BRANCH_POST_FORK` set while `FORK_CUTOVER_TIME` is left unset is legal and expected: that is precisely the image you deploy ahead of the fork, dormant, with the cutover time and the ledger both supplied later.
+The same args are the `mina_version`, `mina_network` and `ledger_config_version` inputs of the Publish workflow.
 
 **Run**:
 

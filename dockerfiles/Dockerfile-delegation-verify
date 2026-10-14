@@ -1,235 +1,83 @@
 #################################################################################################
-# The "stateless verification build" Stage
-# - builds stateless verification tool
-# - adds submission_updater binary to /bin
+# submission_updater + delegation-verify
+# - submission_updater: built here from src/ (static Go binary)
+# - delegation-verify and the network config: released Mina debs from the signed apt repo
 #################################################################################################
 
-# Builder image
-#
-# Source of truth for which toolchain to pin: buildkite/src/Constants/ContainerImages.dhall
-# in MinaProtocol/mina, field minaToolchainBullseye.amd64. That file pins this same
-# image at both refs we build from (3.5.0-mainnet-stop-slot and 4.0.0-mainnet-mesa);
-# the "-devnet" suffix is the toolchain's own build lineage, not a network constraint.
-#
-# Pinned by tag rather than by digest, on purpose: mina CI pins by tag here, and the
-# digest this used to carry was deleted upstream, which broke the build outright.
-#
-# Declared in global scope (before the first FROM) so both builder stages share a
-# single toolchain and cannot drift apart on the next bump.
-ARG MINA_TOOLCHAIN=europe-west3-docker.pkg.dev/o1labs-192920/euro-docker-repo/mina-toolchain:f009c00-bullseye-devnet
+FROM golang:1.22-bookworm AS go
 
-FROM ${MINA_TOOLCHAIN} AS builder
+WORKDIR /build
+COPY src/go.mod src/go.sum ./
+RUN go mod download
+COPY src/ ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/submission_updater .
 
-# Use --build-arg "DUNE_PROFILE=dev" to build a dev image or for CI
-ARG DUNE_PROFILE=mainnet
+FROM debian:bookworm-slim
 
-# branch to checkout on first clone (this will be the only availible branch in the container)
-# can also be a tagged release
-ARG MINA_BRANCH=berkeley
+# Mina release to take the verifier and config from, e.g. 4.0.2-84b8d96.
+ARG MINA_VERSION
+ARG MINA_NETWORK=mainnet
+ARG MINA_PROFILE=mainnet
+# Version of mina-${MINA_NETWORK}-config that ships the ledger tarballs. Empty = MINA_VERSION.
+# Config debs carry the tarballs from MinaProtocol/mina#19737 on; 4.0.1 and 4.0.2 do not,
+# so for those point this at 4.0.0-6850301 (same mainnet ledgers).
+ARG LEDGER_CONFIG_VERSION=""
+ARG MINA_APT_URL=https://stable.apt.packages.minaprotocol.com
+ARG MINA_APT_CHANNEL=stable
+ARG MINA_APT_KEY_FINGERPRINT=386E9DAC378726A48ED5CE56ADB30D9ACE02F414
 
-# repo to checkout the branch from
-ARG MINA_REPO=https://github.com/MinaProtocol/mina
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
-# location of repo used for pins and external package commits
-ARG MINA_DIR=mina
+RUN test -n "${MINA_VERSION}" || { echo "MINA_VERSION build arg is required" >&2; exit 1; }
 
-ENV PATH "$PATH:/usr/lib/go/bin:$HOME/.cargo/bin"
-
-# git will clone into an empty dir, but this also helps us set the workdir in advance
-RUN cd $HOME && rm -rf $HOME/${MINA_DIR} \
-    && git clone \
-    -b "${MINA_BRANCH}" \
-    --depth 1 \
-    --shallow-submodules \
-    --recurse-submodules \
-    ${MINA_REPO} ${HOME}/${MINA_DIR}
-
-WORKDIR $HOME/${MINA_DIR}
-
-RUN git submodule sync && git submodule update --init --recursive
-
-RUN mkdir ${HOME}/app
-
-# HACK: build without special cpu features to allow more people to run delegation verification tool
-# RUN ./scripts/zexe-standardize.sh
-
-RUN eval $(opam config env) \
-    && dune build --profile=${DUNE_PROFILE} \
-    src/app/delegation_verify/delegation_verify.exe \
-    && cp _build/default/src/app/delegation_verify/delegation_verify.exe ./delegation-verify \
-    && rm -rf _build
-
-USER root
-
-# copy binary to /bin
-RUN cp ./delegation-verify /bin/delegation-verify
-
-#################################################################################################
-# The post-hard-fork "stateless verification build" Stage
-# - builds the post-hard-fork (Mesa) stateless verification tool
-# - skipped entirely when MINA_BRANCH_POST_FORK is empty (an empty placeholder
-#   is produced instead so the runtime COPY always succeeds)
-#################################################################################################
-
-FROM ${MINA_TOOLCHAIN} AS builder-post-fork
-
-# Use --build-arg "DUNE_PROFILE_POST_FORK=dev" to build a dev image or for CI
-ARG DUNE_PROFILE_POST_FORK=mainnet
-
-# branch (or tagged release) to build the post-hard-fork binary from
-# when empty (the default) this stage builds nothing and only emits a placeholder
-ARG MINA_BRANCH_POST_FORK=""
-
-# repo to checkout the branch from
-ARG MINA_REPO=https://github.com/MinaProtocol/mina
-
-# location of repo used for pins and external package commits
-ARG MINA_DIR=mina
-
-ENV PATH "$PATH:/usr/lib/go/bin:$HOME/.cargo/bin"
-
-# git will clone into an empty dir, but this also helps us set the workdir in advance
-RUN if [ -n "$MINA_BRANCH_POST_FORK" ]; then \
-    cd $HOME && rm -rf $HOME/${MINA_DIR} \
-    && git clone \
-    -b "${MINA_BRANCH_POST_FORK}" \
-    --depth 1 \
-    --shallow-submodules \
-    --recurse-submodules \
-    ${MINA_REPO} ${HOME}/${MINA_DIR} \
-    ; fi
-
-WORKDIR $HOME/${MINA_DIR}
-
-RUN if [ -n "$MINA_BRANCH_POST_FORK" ]; then \
-    git submodule sync && git submodule update --init --recursive \
-    ; fi
-
-RUN mkdir -p ${HOME}/app
-
-# HACK: build without special cpu features to allow more people to run delegation verification tool
-# RUN ./scripts/zexe-standardize.sh
-
-# DUNE_PROFILE must be exported as an ENVIRONMENT variable, not only passed as
-# dune's --profile flag: mina's comptime layer (src/lib/comptime/gen.sh) reads
-# the env var and silently falls back to the "dev" profile when it is unset,
-# baking dev constraint constants (ledger_depth 10, txn capacity 3) into the
-# binary - a different circuit whose verification rejects every real block.
-# See MinaProtocol/mina#19294.
-RUN if [ -n "$MINA_BRANCH_POST_FORK" ]; then \
-    export DUNE_PROFILE="${DUNE_PROFILE_POST_FORK}" \
-    && eval $(opam config env) \
-    && dune build --profile=${DUNE_PROFILE_POST_FORK} \
-    src/app/delegation_verify/delegation_verify.exe \
-    && cp _build/default/src/app/delegation_verify/delegation_verify.exe ./delegation-verify \
-    && rm -rf _build \
-    ; fi
-
-USER root
-
-# copy binary to /bin (empty placeholder when the post-fork build is skipped,
-# so the runtime stage COPY below never fails)
-RUN if [ -n "$MINA_BRANCH_POST_FORK" ]; then \
-    cp ./delegation-verify /bin/delegation-verify-post-fork; \
-    else \
-    touch /bin/delegation-verify-post-fork; \
-    fi
-
-#################################################################################################
-# The "ledger tarballs" Stage
-# - pre-fetches the genesis/epoch ledger tarballs delegation-verify needs at run time
-# - skipped (empty dir) when LEDGER_TARBALLS is empty
-#
-# Why: the verifier caches ledgers under /tmp/s3_cache_dir and otherwise downloads them
-# from S3 (src/lib/cache_dir in MinaProtocol/mina). The coordinator runs each worker as
-# a fresh Job, so every run paid for a full ~285 MB download of the mainnet ledgers
-# (~270 GB/day of S3 egress at 12 workers / 20 min). Files under /var/lib/coda are the
-# first place the verifier looks, and are never re-downloaded.
-#
-# LEDGER_TARBALLS is a whitespace-separated list of <filename>=<sha3-256>. The filename
-# is the S3 object name delegation-verify would fetch; the hash is the matching
-# s3_data_hash from the runtime config. The build fails on any mismatch, because the
-# verifier does NOT re-check the hash of a file it finds locally.
-#################################################################################################
-
-# Same base as the runtime stage: it already ships curl and an openssl with sha3-256,
-# so no apt-get (bullseye-security's pool is drained, installs from it fail).
-FROM golang:1.22-bullseye AS ledgers
-
-ARG LEDGER_TARBALLS=""
-ARG LEDGER_BUCKET_URL=https://s3-us-west-2.amazonaws.com/snark-keys-ro.o1test.net
-
-RUN mkdir -p /ledgers && cd /ledgers \
-    && for item in ${LEDGER_TARBALLS}; do \
-         f="${item%%=*}"; want="${item#*=}"; \
-         echo "fetching ${f}"; \
-         curl -fsSL --retry 3 -o "${f}" "${LEDGER_BUCKET_URL}/${f}"; \
-         got="$(openssl dgst -sha3-256 -r "${f}" | cut -d' ' -f1)"; \
-         if [ "${got}" != "${want}" ]; then \
-           echo "sha3-256 mismatch for ${f}: got ${got}, want ${want}" >&2; exit 1; \
-         fi; \
-       done
-
-# Runtime image
-FROM golang:1.22-bullseye
-
-# Copy resources from builder to runtime image
-COPY --from=builder /bin/delegation-verify /bin/delegation-verify
-COPY --from=builder-post-fork /bin/delegation-verify-post-fork /bin/delegation-verify-post-fork
-# pre-fetched ledger tarballs (empty when LEDGER_TARBALLS was not set); /var/lib/coda is
-# the verifier's first search path, so a hit here means no S3 download at run time
-COPY --from=ledgers /ledgers/ /var/lib/coda/
-
-# bullseye is past LTS (2026-08-31): deb.debian.org still serves the bullseye-security
-# index but its pool is drained, so installs of anything with a security update
-# (bind9/dnsutils, libxml2, openssl, ...) fail. archive.debian.org carries both suites
-# frozen; its Release files are stale, hence the Valid-Until override.
-RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|; s|http://deb.debian.org/debian |http://archive.debian.org/debian |' /etc/apt/sources.list \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get -o Acquire::Check-Valid-Until=false install -y jq libjemalloc2 wget dnsutils gawk \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gpg jq openssl \
+    && curl -fsSL "${MINA_APT_URL}/repo-signing-key.gpg" -o /tmp/mina.gpg \
+    && gpg --show-keys --with-colons /tmp/mina.gpg | awk -F: '$1=="fpr"{print $10; exit}' | grep -qx "${MINA_APT_KEY_FINGERPRINT}" \
+    && install -D -m 0644 /tmp/mina.gpg /etc/apt/keyrings/mina.gpg \
+    && rm /tmp/mina.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/mina.gpg] ${MINA_APT_URL} bookworm ${MINA_APT_CHANNEL}" \
+         > /etc/apt/sources.list.d/mina.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         "mina-delegation-verify=${MINA_VERSION}" \
+         "mina-logproc=${MINA_VERSION}" \
+         "mina-${MINA_NETWORK}-config=${MINA_VERSION}" \
+    && if [[ -n "${LEDGER_CONFIG_VERSION}" && "${LEDGER_CONFIG_VERSION}" != "${MINA_VERSION}" ]]; then \
+         cd /tmp \
+         && apt-get download "mina-${MINA_NETWORK}-config=${LEDGER_CONFIG_VERSION}" \
+         && dpkg-deb --fsys-tarfile mina-"${MINA_NETWORK}"-config_*.deb \
+            | tar -x -C / --wildcards './var/lib/coda/*.tar.gz' \
+         && rm mina-"${MINA_NETWORK}"-config_*.deb; \
+       fi \
+    && apt-get purge -y gpg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Install libssl1.1.1b (not in apt)
-RUN wget https://www.openssl.org/source/openssl-1.1.1b.tar.gz
-RUN mkdir /opt/openssl
-RUN tar xfvz openssl-1.1.1b.tar.gz --directory /opt/openssl
-RUN rm openssl-1.1.1b.tar.gz
+# Every ledger the config names must be present under /var/lib/coda with the matching
+# s3_data_hash. The verifier trusts local files as is and silently falls back to S3
+# for missing ones, so a gap here would only show up as egress.
+RUN shopt -s nullglob \
+    && cfg="/var/lib/coda/${MINA_NETWORK}.json" \
+    && declare -A have \
+    && for f in /var/lib/coda/*.tar.gz; do \
+         have[$(openssl dgst -sha3-256 -r "$f" | cut -d' ' -f1)]="$f"; \
+       done \
+    && for want in $(jq -r '[.ledger, .epoch_data.staking, .epoch_data.next] | .[] | .s3_data_hash // empty' "$cfg" | sort -u); do \
+         [[ -n "${have[$want]:-}" ]] || { echo "no ledger tarball with sha3-256 ${want} (from ${cfg})" >&2; exit 1; }; \
+         echo "ledger ${want}: ${have[$want]}"; \
+       done
 
-ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/opt/openssl/lib"
-ENV PATH="$PATH:/opt/openssl/bin"
-
-RUN cd /opt/openssl/openssl-1.1.1b && ./config --prefix=/opt/openssl --openssldir=/opt/openssl/ssl
-RUN cd /opt/openssl/openssl-1.1.1b && make && make install
-
-# Rename openssl old binary
-RUN mv /usr/bin/openssl /usr/bin/openssl.old
-
-# Set the Current Working Directory inside the container
-WORKDIR $GOPATH/src
-
-# Copy everything from the current directory to the PWD (Present Working Directory) inside the container
-COPY src src
+COPY --from=go /out/submission_updater /go/bin/submission_updater
 COPY database/cert/sf-class2-root.crt /root/.cassandra/sf-class2-root.crt
-# copy the whole directory so mainnet-post-fork.json (committed on hard-fork day)
-# rides along automatically once it exists
-COPY genesis_ledgers/ /root/genesis_ledgers/
 
-# Download all the dependencies
-RUN cd src && go get -d -v ./...
-
-# Install the package
-RUN cd src && go install -v ./...
-
-# RFC3339 hard-fork cutover time; empty (the default) keeps dual mode off and
-# the wrapper behaves exactly as today
-ARG FORK_CUTOVER_TIME=""
-
-ENV DELEGATION_VERIFY_BIN_PATH=/bin/delegation-verify
-ENV DELEGATION_VERIFY_BIN_PATH_POST_FORK=/bin/delegation-verify-post-fork
+ENV PATH="/go/bin:${PATH}"
+ENV MINA_PROFILE=${MINA_PROFILE}
 ENV SSL_CERTFILE=/root/.cassandra/sf-class2-root.crt
-ENV GENESIS_LEDGER_FILE=/root/genesis_ledgers/mainnet.json
-ENV GENESIS_LEDGER_FILE_POST_FORK=/root/genesis_ledgers/mainnet-post-fork.json
-ENV FORK_CUTOVER_TIME=${FORK_CUTOVER_TIME}
+ENV DELEGATION_VERIFY_BIN_PATH=/usr/local/bin/mina-delegation-verify
+ENV GENESIS_LEDGER_FILE=/var/lib/coda/${MINA_NETWORK}.json
+# One binary serves both partitions, so deployments that still set FORK_CUTOVER_TIME
+# keep passing the startup checks.
+ENV DELEGATION_VERIFY_BIN_PATH_POST_FORK=/usr/local/bin/mina-delegation-verify
+ENV GENESIS_LEDGER_FILE_POST_FORK=/var/lib/coda/${MINA_NETWORK}.json
 
-# Run the executable
 ENTRYPOINT ["submission_updater"]

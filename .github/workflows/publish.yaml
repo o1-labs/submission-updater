@@ -10,40 +10,24 @@ on:
         description: "Enter the Docker Tag Prefix (e.g adhoc-test)"
         required: true
         type: string
-      mina_branch:
-        description: 'Branch of MinaProtocol/mina to build from'
+      mina_version:
+        description: 'Mina release to take mina-delegation-verify and the network config from (deb version, e.g. 4.0.2-84b8d96)'
         required: true
-        default: 'delegation_verify_over_stdin_rc_base'
-      dune_profile:
-        description: 'Dune profile to build with'
+      mina_network:
+        description: 'Network config deb to install (mina-<network>-config)'
         required: true
-        default: 'devnet'
-      mina_branch_post_fork:
-        description: 'Branch of MinaProtocol/mina to build the post-hard-fork binary from (empty = single-binary image)'
-        required: false
-        default: ''
-      dune_profile_post_fork:
-        description: 'Dune profile to build the post-hard-fork binary with (empty = same as dune_profile)'
-        required: false
-        default: ''
-      fork_cutover_time:
-        description: 'RFC3339 hard-fork cutover time baked into the image (empty = dual mode off)'
-        required: false
-        default: ''
-      ledger_tarballs:
-        description: 'Ledger tarballs to bake in, whitespace-separated <filename>=<sha3-256> (empty = fetched from S3 at run time)'
+        default: 'mainnet'
+      ledger_config_version:
+        description: 'Version of mina-<network>-config that ships the ledger tarballs (empty = mina_version)'
         required: false
         default: ''
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKER_TAG_PREFIX: ${{ github.event.inputs.docker_tag_prefix }}
-  MINA_BRANCH: ${{ github.event.inputs.mina_branch }}
-  DUNE_PROFILE: ${{ github.event.inputs.dune_profile }}
-  MINA_BRANCH_POST_FORK: ${{ github.event.inputs.mina_branch_post_fork }}
-  DUNE_PROFILE_POST_FORK: ${{ github.event.inputs.dune_profile_post_fork }}
-  FORK_CUTOVER_TIME: ${{ github.event.inputs.fork_cutover_time }}
-  LEDGER_TARBALLS: ${{ github.event.inputs.ledger_tarballs }}
+  MINA_VERSION: ${{ github.event.inputs.mina_version }}
+  MINA_NETWORK: ${{ github.event.inputs.mina_network }}
+  LEDGER_CONFIG_VERSION: ${{ github.event.inputs.ledger_config_version }}
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -92,12 +76,7 @@ jobs:
       - name: 🛠️ Build Docker Image
         run: |
           TAG=${{ env.TAG }}
-          MINA_BRANCH=${{ env.MINA_BRANCH }}
-          DUNE_PROFILE=${{ env.DUNE_PROFILE }}
-          # MINA_BRANCH_POST_FORK, DUNE_PROFILE_POST_FORK, FORK_CUTOVER_TIME and LEDGER_TARBALLS
-          # reach build.sh through the workflow-level env: map above; they are
-          # deliberately not re-assigned here (free-text values containing spaces
-          # would not survive being spliced unquoted into this block).
+          # MINA_VERSION, MINA_NETWORK and LEDGER_CONFIG_VERSION come from the workflow-level env.
           IMAGE_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}
           nix-shell --run "make docker-delegation-verify"
       - name: 🚚 Push Docker Image
