@@ -52,6 +52,16 @@ case "$1" in
         exit 1
       fi
     fi
+    # Optional ledger tarballs to bake into the image (see the "ledgers" stage in the
+    # Dockerfile). Each item must be <filename>=<sha3-256>; a malformed item fails here
+    # instead of after the multi-hour mina build.
+    LEDGER_ITEM_RE='^[A-Za-z0-9._-]+\.tar\.gz=[0-9a-f]{64}$'
+    for item in ${LEDGER_TARBALLS:-}; do
+      if [[ ! "$item" =~ $LEDGER_ITEM_RE ]]; then
+        echo "LEDGER_TARBALLS item '$item' is not <name>.tar.gz=<sha3-256 hex>."
+        exit 1
+      fi
+    done
     # set default image name for GitHub Container Registry if IMAGE_NAME is not set
     IMAGE_NAME=${IMAGE_NAME:-ghcr.io/o1-labs/submission-updater}
     # Optional post-hard-fork (Mesa) build args. When MINA_BRANCH_POST_FORK is
@@ -64,6 +74,7 @@ case "$1" in
       --build-arg "MINA_BRANCH_POST_FORK=${MINA_BRANCH_POST_FORK:-}" \
       --build-arg "DUNE_PROFILE_POST_FORK=${DUNE_PROFILE_POST_FORK:-$DUNE_PROFILE}" \
       --build-arg "FORK_CUTOVER_TIME=${FORK_CUTOVER_TIME:-}" \
+      --build-arg "LEDGER_TARBALLS=${LEDGER_TARBALLS:-}" \
       -f dockerfiles/Dockerfile-delegation-verify -t "$IMAGE_NAME:$TAG" .
     ;;
   docker-standalone)

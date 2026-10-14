@@ -30,6 +30,10 @@ on:
         description: 'RFC3339 hard-fork cutover time baked into the image (empty = dual mode off)'
         required: false
         default: ''
+      ledger_tarballs:
+        description: 'Ledger tarballs to bake in, whitespace-separated <filename>=<sha3-256> (empty = fetched from S3 at run time)'
+        required: false
+        default: ''
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -39,6 +43,7 @@ env:
   MINA_BRANCH_POST_FORK: ${{ github.event.inputs.mina_branch_post_fork }}
   DUNE_PROFILE_POST_FORK: ${{ github.event.inputs.dune_profile_post_fork }}
   FORK_CUTOVER_TIME: ${{ github.event.inputs.fork_cutover_time }}
+  LEDGER_TARBALLS: ${{ github.event.inputs.ledger_tarballs }}
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -89,7 +94,7 @@ jobs:
           TAG=${{ env.TAG }}
           MINA_BRANCH=${{ env.MINA_BRANCH }}
           DUNE_PROFILE=${{ env.DUNE_PROFILE }}
-          # MINA_BRANCH_POST_FORK, DUNE_PROFILE_POST_FORK and FORK_CUTOVER_TIME
+          # MINA_BRANCH_POST_FORK, DUNE_PROFILE_POST_FORK, FORK_CUTOVER_TIME and LEDGER_TARBALLS
           # reach build.sh through the workflow-level env: map above; they are
           # deliberately not re-assigned here (free-text values containing spaces
           # would not survive being spliced unquoted into this block).

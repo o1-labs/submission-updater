@@ -135,14 +135,59 @@ RUN if [ -n "$MINA_BRANCH_POST_FORK" ]; then \
     touch /bin/delegation-verify-post-fork; \
     fi
 
+#################################################################################################
+# The "ledger tarballs" Stage
+# - pre-fetches the genesis/epoch ledger tarballs delegation-verify needs at run time
+# - skipped (empty dir) when LEDGER_TARBALLS is empty
+#
+# Why: the verifier caches ledgers under /tmp/s3_cache_dir and otherwise downloads them
+# from S3 (src/lib/cache_dir in MinaProtocol/mina). The coordinator runs each worker as
+# a fresh Job, so every run paid for a full ~285 MB download of the mainnet ledgers
+# (~270 GB/day of S3 egress at 12 workers / 20 min). Files under /var/lib/coda are the
+# first place the verifier looks, and are never re-downloaded.
+#
+# LEDGER_TARBALLS is a whitespace-separated list of <filename>=<sha3-256>. The filename
+# is the S3 object name delegation-verify would fetch; the hash is the matching
+# s3_data_hash from the runtime config. The build fails on any mismatch, because the
+# verifier does NOT re-check the hash of a file it finds locally.
+#################################################################################################
+
+# Same base as the runtime stage: it already ships curl and an openssl with sha3-256,
+# so no apt-get (bullseye-security's pool is drained, installs from it fail).
+FROM golang:1.22-bullseye AS ledgers
+
+ARG LEDGER_TARBALLS=""
+ARG LEDGER_BUCKET_URL=https://s3-us-west-2.amazonaws.com/snark-keys-ro.o1test.net
+
+RUN mkdir -p /ledgers && cd /ledgers \
+    && for item in ${LEDGER_TARBALLS}; do \
+         f="${item%%=*}"; want="${item#*=}"; \
+         echo "fetching ${f}"; \
+         curl -fsSL --retry 3 -o "${f}" "${LEDGER_BUCKET_URL}/${f}"; \
+         got="$(openssl dgst -sha3-256 -r "${f}" | cut -d' ' -f1)"; \
+         if [ "${got}" != "${want}" ]; then \
+           echo "sha3-256 mismatch for ${f}: got ${got}, want ${want}" >&2; exit 1; \
+         fi; \
+       done
+
 # Runtime image
 FROM golang:1.22-bullseye
 
 # Copy resources from builder to runtime image
 COPY --from=builder /bin/delegation-verify /bin/delegation-verify
 COPY --from=builder-post-fork /bin/delegation-verify-post-fork /bin/delegation-verify-post-fork
+# pre-fetched ledger tarballs (empty when LEDGER_TARBALLS was not set); /var/lib/coda is
+# the verifier's first search path, so a hit here means no S3 download at run time
+COPY --from=ledgers /ledgers/ /var/lib/coda/
 
-RUN apt-get update && apt-get install -y jq libjemalloc2 wget dnsutils gawk
+# bullseye is past LTS (2026-08-31): deb.debian.org still serves the bullseye-security
+# index but its pool is drained, so installs of anything with a security update
+# (bind9/dnsutils, libxml2, openssl, ...) fail. archive.debian.org carries both suites
+# frozen; its Release files are stale, hence the Valid-Until override.
+RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|; s|http://deb.debian.org/debian |http://archive.debian.org/debian |' /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::Check-Valid-Until=false install -y jq libjemalloc2 wget dnsutils gawk \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install libssl1.1.1b (not in apt)
 RUN wget https://www.openssl.org/source/openssl-1.1.1b.tar.gz

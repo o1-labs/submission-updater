@@ -100,7 +100,7 @@ For the Mina "Mesa" hard fork a single image can carry **two** `delegation-verif
 
 Passing `FORK_CUTOVER_TIME` *to the build* bakes an armed cutover into the image, so the build refuses to proceed unless the image can actually serve it: `MINA_BRANCH_POST_FORK` must be set, `genesis_ledgers/mainnet-post-fork.json` must exist, and the timestamp must parse (checked with GNU `date -d`; skipped on BSD/macOS `date`). This is the fork-day rebuild path. To arm an image you built earlier instead, leave it out here and set it at deploy time — see [Arming the cutover on an already-built image](#arming-the-cutover-on-an-already-built-image).
 
-The same three knobs are exposed as optional `workflow_dispatch` inputs of the Publish workflow (`mina_branch_post_fork`, `dune_profile_post_fork`, `fork_cutover_time`).
+The same three knobs are exposed as optional `workflow_dispatch` inputs of the Publish workflow (`mina_branch_post_fork`, `dune_profile_post_fork`, `fork_cutover_time`), as is `ledger_tarballs` (see below).
 
 Resulting image layout:
 
@@ -126,6 +126,27 @@ $ TAG=1.0 \
 ```
 
 Both binaries above are built on the `devnet` profile: `DUNE_PROFILE_POST_FORK` is unset and therefore inherits `DUNE_PROFILE`.
+
+### Baking ledger tarballs into the image
+
+`delegation-verify` needs the genesis ledger and both epoch ledgers named in its config. It looks for them as tarballs under `/var/lib/coda` first and, failing that, downloads them from S3 into `/tmp/s3_cache_dir` (`src/lib/cache_dir` in Mina). The coordinator starts every worker as a fresh Job, so nothing in `/tmp` survives between runs and each worker re-downloads the full set — ~285 MB for the mainnet Mesa ledgers, ~270 GB/day of S3 egress at 12 workers every 20 minutes.
+
+`LEDGER_TARBALLS` pre-fetches the tarballs at build time and places them under `/var/lib/coda`, so the verifier never reaches S3. It is a whitespace-separated list of `<filename>=<sha3-256>`:
+
+ - `<filename>` is the S3 object name the verifier would download (`genesis_ledger_<hash>.tar.gz`, `epoch_ledger_<hash>.tar.gz`). The quickest way to get them is the verifier's own trace log, or the S3 access log of the bucket.
+ - `<sha3-256>` is the matching `s3_data_hash` from the runtime config (`ledger.s3_data_hash`, `epoch_data.staking.s3_data_hash`, `epoch_data.next.s3_data_hash`).
+
+The build fails on any hash mismatch. This check matters: the verifier only verifies the hash of a file it downloads itself, a file found under `/var/lib/coda` is trusted as is. `LEDGER_BUCKET_URL` (default `https://s3-us-west-2.amazonaws.com/snark-keys-ro.o1test.net`) is where the tarballs are fetched from at build time. Empty `LEDGER_TARBALLS` (the default) leaves the image as before: an empty `/var/lib/coda` and download at run time.
+
+Example for mainnet Mesa (post-fork config as of September 2026):
+
+```
+LEDGER_TARBALLS="genesis_ledger_8f90b767376bb0196dc19cad67793299d5d51691c446e512b246ca5d8259e00d.tar.gz=68f5a0c1f32ccc36e8c13f9d6b38a2de5d82155887752b795bf2d60cbed441a1 \
+epoch_ledger_7ceaa1961cbb1630f98cbb17ac8fe04aeeadbe7b72b302d09789537b15474f3d.tar.gz=d32def351368bd72331a85822f06c42e888c58790c7481748fe38e4ffa509d7b \
+epoch_ledger_cd423fcdf17f7aeb5db014e4782756ecd12b9e5ac31c3201f3023e8cc9721d71.tar.gz=39ffe8728842e772de3c7d647f430bab52170ff86919f84ef4e8dbe3b358e493"
+```
+
+The same list is the optional `ledger_tarballs` input of the Publish workflow. The ledgers belong to one fork config, so a config change (new `s3_data_hash`) needs a rebuild with the new list; a stale list is harmless, the verifier simply falls back to S3 for the files it does not find.
 
 ### Arming the cutover on an already-built image
 
