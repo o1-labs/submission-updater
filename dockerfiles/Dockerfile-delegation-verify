@@ -2,6 +2,9 @@
 # submission_updater + delegation-verify
 # - submission_updater: built here from src/ (static Go binary)
 # - delegation-verify and the network config: released Mina debs from the signed apt repo
+#
+# One post-fork (Mesa) verifier only: this image cannot verify pre-fork submissions.
+# Do not re-run windows before the 2026-09-03T18:00Z cutover with it.
 #################################################################################################
 
 FROM golang:1.22-bookworm AS go
@@ -17,7 +20,7 @@ FROM debian:bookworm-slim
 # Mina release to take the verifier and config from, e.g. 4.0.2-84b8d96.
 ARG MINA_VERSION
 ARG MINA_NETWORK=mainnet
-ARG MINA_PROFILE=mainnet
+ARG MINA_PROFILE=${MINA_NETWORK}
 # Version of mina-${MINA_NETWORK}-config that ships the ledger tarballs. Empty = MINA_VERSION.
 # Config debs carry the tarballs from MinaProtocol/mina#19737 on; 4.0.1 and 4.0.2 do not,
 # so for those point this at 4.0.0-6850301 (same mainnet ledgers).
@@ -33,9 +36,12 @@ RUN test -n "${MINA_VERSION}" || { echo "MINA_VERSION build arg is required" >&2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gpg jq openssl \
     && curl -fsSL "${MINA_APT_URL}/repo-signing-key.gpg" -o /tmp/mina.gpg \
-    && gpg --show-keys --with-colons /tmp/mina.gpg | awk -F: '$1=="fpr"{print $10; exit}' | grep -qx "${MINA_APT_KEY_FINGERPRINT}" \
+    && gpg --show-keys --with-colons /tmp/mina.gpg > /tmp/mina.keys \
+    && { [[ "$(grep -c '^pub:' /tmp/mina.keys)" == 1 ]] \
+         || { echo "expected exactly one key in repo-signing-key.gpg" >&2; exit 1; }; } \
+    && awk -F: '$1=="fpr"{print $10; exit}' /tmp/mina.keys | grep -qx "${MINA_APT_KEY_FINGERPRINT}" \
     && install -D -m 0644 /tmp/mina.gpg /etc/apt/keyrings/mina.gpg \
-    && rm /tmp/mina.gpg \
+    && rm /tmp/mina.gpg /tmp/mina.keys \
     && echo "deb [signed-by=/etc/apt/keyrings/mina.gpg] ${MINA_APT_URL} bookworm ${MINA_APT_CHANNEL}" \
          > /etc/apt/sources.list.d/mina.list \
     && apt-get update \
@@ -53,19 +59,9 @@ RUN apt-get update \
     && apt-get purge -y gpg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Every ledger the config names must be present under /var/lib/coda with the matching
-# s3_data_hash. The verifier trusts local files as is and silently falls back to S3
-# for missing ones, so a gap here would only show up as egress.
-RUN shopt -s nullglob \
-    && cfg="/var/lib/coda/${MINA_NETWORK}.json" \
-    && declare -A have \
-    && for f in /var/lib/coda/*.tar.gz; do \
-         have[$(openssl dgst -sha3-256 -r "$f" | cut -d' ' -f1)]="$f"; \
-       done \
-    && for want in $(jq -r '[.ledger, .epoch_data.staking, .epoch_data.next] | .[] | .s3_data_hash // empty' "$cfg" | sort -u); do \
-         [[ -n "${have[$want]:-}" ]] || { echo "no ledger tarball with sha3-256 ${want} (from ${cfg})" >&2; exit 1; }; \
-         echo "ledger ${want}: ${have[$want]}"; \
-       done
+# Every ledger the config names must be in /var/lib/coda with the matching s3_data_hash.
+COPY scripts/check-ledgers.sh /usr/local/bin/check-ledgers.sh
+RUN check-ledgers.sh "/var/lib/coda/${MINA_NETWORK}.json" /var/lib/coda
 
 COPY --from=go /out/submission_updater /go/bin/submission_updater
 COPY database/cert/sf-class2-root.crt /root/.cassandra/sf-class2-root.crt
@@ -76,7 +72,9 @@ ENV SSL_CERTFILE=/root/.cassandra/sf-class2-root.crt
 ENV DELEGATION_VERIFY_BIN_PATH=/usr/local/bin/mina-delegation-verify
 ENV GENESIS_LEDGER_FILE=/var/lib/coda/${MINA_NETWORK}.json
 # One binary serves both partitions, so deployments that still set FORK_CUTOVER_TIME
-# keep passing the startup checks.
+# keep passing the startup checks. With FORK_CUTOVER_TIME set, pre-cutover submissions
+# go to this Mesa verifier too and are stored as failed. Real dual-binary routing needs
+# a pre-fork binary and config mounted in and these two variables pointed at them.
 ENV DELEGATION_VERIFY_BIN_PATH_POST_FORK=/usr/local/bin/mina-delegation-verify
 ENV GENESIS_LEDGER_FILE_POST_FORK=/var/lib/coda/${MINA_NETWORK}.json
 

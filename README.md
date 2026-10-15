@@ -81,7 +81,7 @@ Build args (env variables of `make docker-delegation-verify`):
  - `MINA_PROFILE` - default `MINA_NETWORK`. The verifier deb is profile-generic and reads it at run time.
  - `LEDGER_CONFIG_VERSION` - default `MINA_VERSION`. Version of `mina-<network>-config` that ships the ledger tarballs. Config debs carry them from MinaProtocol/mina#19737 on. For 4.0.1 and 4.0.2 use `4.0.0-6850301`, which has the same mainnet ledgers.
 
-The verifier looks for the genesis and epoch ledgers under `/var/lib/coda` first and downloads them from S3 otherwise; files found locally are not hash-checked. The build therefore fails unless every `s3_data_hash` in `/var/lib/coda/<network>.json` matches a tarball in `/var/lib/coda`.
+The verifier looks for the genesis and epoch ledgers under `/var/lib/coda` first and downloads them from S3 otherwise; files found locally are not hash-checked. The build therefore fails unless every `s3_data_hash` in `/var/lib/coda/<network>.json` matches a tarball in `/var/lib/coda` (`scripts/check-ledgers.sh`, tested by `scripts/test-check-ledgers.sh`).
 
 The image sets:
 
@@ -89,7 +89,7 @@ The image sets:
  - `GENESIS_LEDGER_FILE` and `GENESIS_LEDGER_FILE_POST_FORK` - both `/var/lib/coda/<network>.json`
  - `MINA_PROFILE`, `SSL_CERTFILE`
 
-`FORK_CUTOVER_TIME` is not set. Dual-binary routing is still supported at run time: set `FORK_CUTOVER_TIME` and point the `*_POST_FORK` variables at a second binary and config.
+The image carries one post-fork (Mesa) verifier and cannot verify pre-fork submissions. Do not re-run windows before the 2026-09-03T18:00Z cutover with it: with `FORK_CUTOVER_TIME` set, pre-cutover submissions also go to the Mesa verifier and are stored as failed. `FORK_CUTOVER_TIME` is not set in the image. Dual-binary routing still works at run time only if a pre-fork binary and its config are mounted into the container and `DELEGATION_VERIFY_BIN_PATH` and `GENESIS_LEDGER_FILE` point at them.
 
 **Build**:
 
