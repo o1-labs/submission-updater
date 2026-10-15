@@ -266,38 +266,6 @@ func TestBoundedBufferKeepsTail(t *testing.T) {
 	}
 }
 
-func TestPartitionSubmissionsByCutover(t *testing.T) {
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	submissions := []Submission{
-		{ID: "before", SubmittedAt: cutover.Add(-time.Hour)},
-		{ID: "just-before", SubmittedAt: cutover.Add(-time.Second)},
-		{ID: "at-cutover", SubmittedAt: cutover},
-		{ID: "after", SubmittedAt: cutover.Add(time.Hour)},
-	}
-
-	preFork, postFork := partitionSubmissionsByCutover(submissions, cutover)
-
-	wantPreFork := []string{"before", "just-before"}
-	wantPostFork := []string{"at-cutover", "after"}
-
-	if len(preFork) != len(wantPreFork) {
-		t.Fatalf("partitionSubmissionsByCutover() pre-fork size = %v, want %v", len(preFork), len(wantPreFork))
-	}
-	for i, sub := range preFork {
-		if sub.ID != wantPreFork[i] {
-			t.Errorf("partitionSubmissionsByCutover() pre-fork[%d] = %v, want %v", i, sub.ID, wantPreFork[i])
-		}
-	}
-	if len(postFork) != len(wantPostFork) {
-		t.Fatalf("partitionSubmissionsByCutover() post-fork size = %v, want %v", len(postFork), len(wantPostFork))
-	}
-	for i, sub := range postFork {
-		if sub.ID != wantPostFork[i] {
-			t.Errorf("partitionSubmissionsByCutover() post-fork[%d] = %v, want %v", i, sub.ID, wantPostFork[i])
-		}
-	}
-}
-
 // writeStubVerifier creates a stub delegation-verify executable that records
 // the arguments it was invoked with and echoes each input submission back on
 // its own line, tagging validation_error with the given marker so tests can
@@ -317,118 +285,6 @@ sed -e 's/^\[//' -e 's/\]$//' -e 's/"validation_error":""/"validation_error":"%s
 	return binPath, argsFile
 }
 
-func newTestAppContext(cutover time.Time, preBin, postBin string) *AppContext {
-	return &AppContext{
-		AppConfig: AppConfig{
-			DelegationVerifyBinPath:         preBin,
-			GenesisLedgerFile:               "/config/pre-fork-ledger.json",
-			ForkCutoverTime:                 &cutover,
-			DelegationVerifyBinPathPostFork: postBin,
-			GenesisLedgerFilePostFork:       "/config/post-fork-ledger.json",
-		},
-		Log: logging.Logger("test"),
-	}
-}
-
-func TestVerifySubmissionsDualMode(t *testing.T) {
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin, preArgsFile := writeStubVerifier(t, dir, "delegation-verify-pre-fork", "pre-fork-stub")
-	postBin, postArgsFile := writeStubVerifier(t, dir, "delegation-verify-post-fork", "post-fork-stub")
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	submissions := []Submission{
-		{ID: "pre-1", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Hour), Submitter: "B62pre1"},
-		{ID: "pre-2", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Second), Submitter: "B62pre2"},
-		{ID: "at-cutover", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover, Submitter: "B62boundary"},
-		{ID: "post-1", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(time.Hour), Submitter: "B62post1"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err != nil {
-		t.Fatalf("verifySubmissions() error = %v", err)
-	}
-
-	// each submission should be processed by exactly the right stub, and the
-	// results of both runs should be merged
-	wantMarkers := map[string]string{
-		"pre-1":      "pre-fork-stub",
-		"pre-2":      "pre-fork-stub",
-		"at-cutover": "post-fork-stub",
-		"post-1":     "post-fork-stub",
-	}
-	if len(verifiedSubmissions) != len(submissions) {
-		t.Fatalf("verifySubmissions() returned %v submissions, want %v", len(verifiedSubmissions), len(submissions))
-	}
-	seen := make(map[string]bool)
-	for _, sub := range verifiedSubmissions {
-		want, known := wantMarkers[sub.ID]
-		if !known {
-			t.Errorf("verifySubmissions() returned unexpected submission %v", sub.ID)
-			continue
-		}
-		if seen[sub.ID] {
-			t.Errorf("verifySubmissions() returned submission %v more than once", sub.ID)
-		}
-		seen[sub.ID] = true
-		if sub.ValidationError != want {
-			t.Errorf("submission %v processed by %q, want %q", sub.ID, sub.ValidationError, want)
-		}
-	}
-
-	// each stub should be invoked with its own config file
-	assertStubArgs(t, preArgsFile, "stdin --config-file /config/pre-fork-ledger.json")
-	assertStubArgs(t, postArgsFile, "stdin --config-file /config/post-fork-ledger.json")
-}
-
-func TestVerifySubmissionsSkipsEmptyPostForkPartition(t *testing.T) {
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin, _ := writeStubVerifier(t, dir, "delegation-verify-pre-fork", "pre-fork-stub")
-	postBin, postArgsFile := writeStubVerifier(t, dir, "delegation-verify-post-fork", "post-fork-stub")
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	// all submissions are pre-fork, so the post-fork stub must not be invoked
-	submissions := []Submission{
-		{ID: "pre-1", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Hour), Submitter: "B62pre1"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err != nil {
-		t.Fatalf("verifySubmissions() error = %v", err)
-	}
-	if len(verifiedSubmissions) != 1 || verifiedSubmissions[0].ValidationError != "pre-fork-stub" {
-		t.Errorf("verifySubmissions() = %v, want single submission processed by pre-fork-stub", verifiedSubmissions)
-	}
-	if _, err := os.Stat(postArgsFile); !os.IsNotExist(err) {
-		t.Errorf("post-fork stub was invoked for an empty partition")
-	}
-}
-
-func TestVerifySubmissionsSkipsEmptyPreForkPartition(t *testing.T) {
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin, preArgsFile := writeStubVerifier(t, dir, "delegation-verify-pre-fork", "pre-fork-stub")
-	postBin, _ := writeStubVerifier(t, dir, "delegation-verify-post-fork", "post-fork-stub")
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	// all submissions are at/after the cutover, so the pre-fork stub must not be invoked
-	submissions := []Submission{
-		{ID: "post-1", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(time.Hour), Submitter: "B62post1"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err != nil {
-		t.Fatalf("verifySubmissions() error = %v", err)
-	}
-	if len(verifiedSubmissions) != 1 || verifiedSubmissions[0].ValidationError != "post-fork-stub" {
-		t.Errorf("verifySubmissions() = %v, want single submission processed by post-fork-stub", verifiedSubmissions)
-	}
-	if _, err := os.Stat(preArgsFile); !os.IsNotExist(err) {
-		t.Errorf("pre-fork stub was invoked for an empty partition")
-	}
-}
-
 func assertStubArgs(t *testing.T, argsFile, want string) {
 	t.Helper()
 	args, err := os.ReadFile(argsFile)
@@ -440,15 +296,14 @@ func assertStubArgs(t *testing.T, argsFile, want string) {
 	}
 }
 
-func TestVerifySubmissionsSingleMode(t *testing.T) {
-	// With no cutover configured, verifySubmissions is one run through the
-	// pre-fork binary with the pre-fork config, exactly as before.
+func TestVerifySubmissions(t *testing.T) {
+	// verifySubmissions is one run through the binary with the configured ledger file.
 	dir := t.TempDir()
-	bin, argsFile := writeStubVerifier(t, dir, "delegation-verify", "single-mode-stub")
+	bin, argsFile := writeStubVerifier(t, dir, "delegation-verify", "stub")
 	appCtx := &AppContext{
 		AppConfig: AppConfig{
 			DelegationVerifyBinPath: bin,
-			GenesisLedgerFile:       "/config/pre-fork-ledger.json",
+			GenesisLedgerFile:       "/config/ledger.json",
 		},
 		Log: logging.Logger("test"),
 	}
@@ -461,122 +316,19 @@ func TestVerifySubmissionsSingleMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verifySubmissions() error = %v", err)
 	}
-	if len(verifiedSubmissions) != 1 || verifiedSubmissions[0].ValidationError != "single-mode-stub" {
-		t.Errorf("verifySubmissions() = %v, want single submission processed by single-mode-stub", verifiedSubmissions)
+	if len(verifiedSubmissions) != 1 || verifiedSubmissions[0].ValidationError != "stub" {
+		t.Errorf("verifySubmissions() = %v, want single submission processed by stub", verifiedSubmissions)
 	}
-	assertStubArgs(t, argsFile, "stdin --config-file /config/pre-fork-ledger.json")
-}
-
-// writeStubFailing creates a stub delegation-verify executable that drains
-// stdin, reports a failure on stderr, and exits non-zero.
-func writeStubFailing(t *testing.T, dir, name, message string) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	script := fmt.Sprintf("#!/bin/sh\ncat > /dev/null\necho %q >&2\nexit 4\n", message)
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("error writing failing stub %v: %v", name, err)
-	}
-	return path
-}
-
-func TestVerifySubmissionsBanksSuccessfulPartitionOnFailure(t *testing.T) {
-	// A failing partition must not discard the other partition's completed
-	// work: the successes are returned alongside an error naming the failure.
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin, _ := writeStubVerifier(t, dir, "delegation-verify-pre-fork", "pre-fork-stub")
-	postBin := writeStubFailing(t, dir, "delegation-verify-post-fork", "post-fork boom")
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	submissions := []Submission{
-		{ID: "pre-1", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Hour), Submitter: "B62pre1"},
-		{ID: "post-1", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(time.Hour), Submitter: "B62post1"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err == nil {
-		t.Fatal("expected an error from the failing post-fork partition")
-	}
-	if !strings.Contains(err.Error(), "post-fork:") {
-		t.Errorf("error should name the post-fork partition, got: %v", err)
-	}
-	if strings.Contains(err.Error(), "pre-fork:") {
-		t.Errorf("error should not name the successful pre-fork partition, got: %v", err)
-	}
-	if len(verifiedSubmissions) != 1 || verifiedSubmissions[0].ID != "pre-1" || verifiedSubmissions[0].ValidationError != "pre-fork-stub" {
-		t.Errorf("verifySubmissions() = %v, want the pre-fork submission processed by pre-fork-stub", verifiedSubmissions)
-	}
-}
-
-func TestVerifySubmissionsReportsBothFailedPartitions(t *testing.T) {
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin := writeStubFailing(t, dir, "delegation-verify-pre-fork", "pre-fork boom")
-	postBin := writeStubFailing(t, dir, "delegation-verify-post-fork", "post-fork boom")
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	submissions := []Submission{
-		{ID: "pre-1", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Hour), Submitter: "B62pre1"},
-		{ID: "post-1", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(time.Hour), Submitter: "B62post1"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err == nil {
-		t.Fatal("expected an error when both partitions fail")
-	}
-	if !strings.Contains(err.Error(), "pre-fork:") || !strings.Contains(err.Error(), "post-fork:") {
-		t.Errorf("error should name both failed partitions, got: %v", err)
-	}
-	if len(verifiedSubmissions) != 0 {
-		t.Errorf("verifySubmissions() = %v, want no submissions when both partitions fail", verifiedSubmissions)
-	}
-}
-
-func TestVerifySubmissionsIsolatesMalformedRecordToItsPartition(t *testing.T) {
-	// A malformed record in one partition costs that one record, per the batch
-	// isolation semantics - never the rest of its partition, and never the
-	// other partition.
-	cutover := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	dir := t.TempDir()
-	preBin, _ := writeStubVerifier(t, dir, "delegation-verify-pre-fork", "pre-fork-stub")
-	postBin := writeStubPrinter(t,
-		`{"submitted_at_date":"2026-09-03","submitter":"B62post1","verified":true}`,
-		`{"submitted_at_date":12345}`,
-	)
-	appCtx := newTestAppContext(cutover, preBin, postBin)
-
-	submissions := []Submission{
-		{ID: "pre-1", SubmittedAtDate: "2026-09-02", SubmittedAt: cutover.Add(-time.Hour), Submitter: "B62pre1"},
-		{ID: "post-1", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(time.Hour), Submitter: "B62post1"},
-		{ID: "post-2", SubmittedAtDate: "2026-09-03", SubmittedAt: cutover.Add(2 * time.Hour), Submitter: "B62post2"},
-	}
-
-	verifiedSubmissions, err := appCtx.verifySubmissions(submissions)
-	if err != nil {
-		t.Fatalf("verifySubmissions() error = %v", err)
-	}
-	if len(verifiedSubmissions) != 2 {
-		t.Fatalf("verifySubmissions() returned %v submissions, want 2 (%+v)", len(verifiedSubmissions), verifiedSubmissions)
-	}
-	if verifiedSubmissions[0].ID != "pre-1" || verifiedSubmissions[0].ValidationError != "pre-fork-stub" {
-		t.Errorf("pre-fork partition was affected: %+v", verifiedSubmissions[0])
-	}
-	if verifiedSubmissions[1].Submitter != "B62post1" {
-		t.Errorf("surviving post-fork record = %+v, want submitter B62post1", verifiedSubmissions[1])
-	}
+	assertStubArgs(t, argsFile, "stdin --config-file /config/ledger.json")
 }
 
 // Records the verifier emits on the first pass. The sok failure carries the
 // empty payload delegation_verify produces when it short-circuits on an error:
 // no state_hash, parent, height or slot.
 const (
-	// post-fork (4.0.0 Mesa): delegation_verify's explicit check
-	sokFailRecord = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
-	// pre-fork (Berkeley / 3.5.0 stop-slot): Transaction_snark.verify's
-	// internal check, reported with its own prefix and wording
-	sokFailRecordPreFork = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
-	cleanRecord          = `{"submitted_at":"2026-09-03T02:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62clean","block_hash":"hashClean","state_hash":"stateClean","verified":true}`
-	otherFailRecord      = `{"submitted_at":"2026-09-03T03:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62other","block_hash":"hashOther","state_hash":"","verified":false,"validation_error":"invalid block proof"}`
+	sokFailRecord   = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62sok","block_hash":"hashSok","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
+	cleanRecord     = `{"submitted_at":"2026-09-03T02:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62clean","block_hash":"hashClean","state_hash":"stateClean","verified":true}`
+	otherFailRecord = `{"submitted_at":"2026-09-03T03:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62other","block_hash":"hashOther","state_hash":"","verified":false,"validation_error":"invalid block proof"}`
 
 	// What the retry returns once the snark work is gone: the block verified on
 	// its own, so the payload is complete.
@@ -659,26 +411,21 @@ func stubInvocations(t *testing.T, countFile string) int {
 }
 
 func TestIsSokMismatch(t *testing.T) {
-	// The check moved between eras, so the waiver has to recognise both
-	// spellings; anything else must stay untouched.
+	// Only the delegation_verify sok-digest message is waived; anything else
+	// must stay untouched.
 	testCases := []struct {
 		name            string
 		validationError string
 		want            bool
 	}{
 		{
-			name:            "post-fork explicit check",
+			name:            "sok-digest check",
 			validationError: "proof's sok message digest does not match the sok message",
 			want:            true,
 		},
 		{
-			name:            "pre-fork Transaction_snark.verify check",
-			validationError: "Transaction_snark.verify: Mismatched sok_message",
-			want:            true,
-		},
-		{
-			name:            "pre-fork wording with trailing context",
-			validationError: "Transaction_snark.verify: Mismatched sok_message (statement 3)",
+			name:            "sok-digest check with leading context",
+			validationError: "snark work: proof's sok message digest does not match the sok message",
 			want:            true,
 		},
 		{
@@ -707,16 +454,11 @@ func TestRunDelegationVerifyCommandRetriesSokMismatchWithoutSnarkWork(t *testing
 	// real payload. Marking the short-circuited record verified would leave
 	// state_hash empty, and the coordinator drops NULL state hashes before it
 	// awards points - so such a submission would score zero either way.
-	//
-	// Both era spellings have to travel this path: the pre-fork binaries in
-	// use on mainnet today report the mismatch from inside
-	// Transaction_snark.verify, the post-fork ones from delegation_verify.
 	testCases := []struct {
 		name       string
 		failRecord string
 	}{
-		{name: "post-fork wording", failRecord: sokFailRecord},
-		{name: "pre-fork wording", failRecord: sokFailRecordPreFork},
+		{name: "sok-digest mismatch", failRecord: sokFailRecord},
 	}
 
 	for _, tc := range testCases {
@@ -818,8 +560,7 @@ func TestRunDelegationVerifyCommandKeepsSokMismatchWhenFlagOff(t *testing.T) {
 		name       string
 		failRecord string
 	}{
-		{name: "post-fork wording", failRecord: sokFailRecord},
-		{name: "pre-fork wording", failRecord: sokFailRecordPreFork},
+		{name: "sok-digest mismatch", failRecord: sokFailRecord},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertSokMismatchKeptWhenFlagOff(t, tc.failRecord)
@@ -888,11 +629,11 @@ func TestRunDelegationVerifyCommandSkipsRetryWithoutSokMismatch(t *testing.T) {
 // sok-failing rows sat in such a pair. Postgres gives these rows distinct ids;
 // Cassandra populates no id at all, so there they collapse onto one key.
 const (
-	dupFailRecord = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	dupFailRecord = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
 	dupOKRecord   = `{"submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
 
-	dupFailRecordID1 = `{"id":"1","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
-	dupFailRecordID2 = `{"id":"2","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"Transaction_snark.verify: Mismatched sok_message"}`
+	dupFailRecordID1 = `{"id":"1","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
+	dupFailRecordID2 = `{"id":"2","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"","verified":false,"validation_error":"proof's sok message digest does not match the sok message"}`
 	dupOKRecordID1   = `{"id":"1","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
 	dupOKRecordID2   = `{"id":"2","submitted_at":"2026-09-03T01:00:00Z","submitted_at_date":"2026-09-03","submitter":"B62dup","block_hash":"hashDup","state_hash":"stateDup","parent":"parentDup","height":9,"slot":3,"verified":true}`
 )

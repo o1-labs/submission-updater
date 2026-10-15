@@ -1,12 +1,10 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	logging "github.com/ipfs/go-log/v2"
 )
@@ -22,14 +20,6 @@ func LoadEnv(log logging.EventLogger) AppConfig {
 	tolerateSokMismatch := boolEnvChecked("TOLERATE_SOK_MISMATCH", log)
 	networkName := getEnvChecked("NETWORK_NAME", log)
 	genesisLedgerFile := os.Getenv("GENESIS_LEDGER_FILE")
-
-	// dual-verifier (hard fork cutover) configuration
-	delegationVerifyBinPathPostFork := os.Getenv("DELEGATION_VERIFY_BIN_PATH_POST_FORK")
-	genesisLedgerFilePostFork := os.Getenv("GENESIS_LEDGER_FILE_POST_FORK")
-	forkCutoverTime, err := parseForkCutoverConfig(os.Getenv("FORK_CUTOVER_TIME"), delegationVerifyBinPathPostFork, genesisLedgerFilePostFork)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
 
 	// AWS configurations
 	bucketName := getEnvChecked("AWS_S3_BUCKET", log)
@@ -85,9 +75,6 @@ func LoadEnv(log logging.EventLogger) AppConfig {
 	config.NoChecks = noChecks
 	config.TolerateSokMismatch = tolerateSokMismatch
 	config.GenesisLedgerFile = genesisLedgerFile
-	config.ForkCutoverTime = forkCutoverTime
-	config.DelegationVerifyBinPathPostFork = delegationVerifyBinPathPostFork
-	config.GenesisLedgerFilePostFork = genesisLedgerFilePostFork
 	config.SubmissionStorage = submissionStorage
 	config.CassandraConfig = &CassandraConfig{
 		Keyspace:             awsKeyspace,
@@ -119,60 +106,6 @@ func LoadEnv(log logging.EventLogger) AppConfig {
 	}
 
 	return config
-}
-
-// parseForkCutoverConfig validates the dual-verifier (hard fork cutover) settings.
-// An empty cutover means dual-verifier mode is disabled and nil is returned.
-// When the cutover is set, it must be a valid RFC3339 timestamp and both the
-// post-fork delegation-verify binary and the post-fork genesis ledger file must
-// be set: the post-fork verification keys derive from the runtime config's fork
-// constants, so without --config-file the post-fork binary falls back to
-// compiled-in constants (fork = None) and rejects every post-fork submission.
-// Both paths are also validated on disk at startup, since with the cutover set
-// ahead of the fork they are not exercised until fork day and a typo would
-// otherwise stay invisible for weeks.
-func parseForkCutoverConfig(cutover, postForkBinPath, postForkConfigPath string) (*time.Time, error) {
-	if cutover == "" {
-		return nil, nil
-	}
-	cutoverTime, err := time.Parse(time.RFC3339, cutover)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing FORK_CUTOVER_TIME as RFC3339: %v", err)
-	}
-	if postForkBinPath == "" {
-		return nil, fmt.Errorf("missing DELEGATION_VERIFY_BIN_PATH_POST_FORK environment variable (required when FORK_CUTOVER_TIME is set)")
-	}
-	if postForkConfigPath == "" {
-		return nil, fmt.Errorf("missing GENESIS_LEDGER_FILE_POST_FORK environment variable (required when FORK_CUTOVER_TIME is set: without --config-file the post-fork binary runs with pre-fork constants and fails all post-fork submissions)")
-	}
-	if err := checkPostForkFiles(postForkBinPath, postForkConfigPath); err != nil {
-		return nil, err
-	}
-	return &cutoverTime, nil
-}
-
-// checkPostForkFiles verifies at startup that the post-fork delegation-verify
-// binary and genesis ledger file exist, are regular files, and that the binary
-// is executable.
-func checkPostForkFiles(postForkBinPath, postForkConfigPath string) error {
-	binInfo, err := os.Stat(postForkBinPath)
-	if err != nil {
-		return fmt.Errorf("DELEGATION_VERIFY_BIN_PATH_POST_FORK: cannot stat %s: %v", postForkBinPath, err)
-	}
-	if !binInfo.Mode().IsRegular() {
-		return fmt.Errorf("DELEGATION_VERIFY_BIN_PATH_POST_FORK: %s is not a regular file", postForkBinPath)
-	}
-	if binInfo.Mode().Perm()&0111 == 0 {
-		return fmt.Errorf("DELEGATION_VERIFY_BIN_PATH_POST_FORK: %s is not executable", postForkBinPath)
-	}
-	configInfo, err := os.Stat(postForkConfigPath)
-	if err != nil {
-		return fmt.Errorf("GENESIS_LEDGER_FILE_POST_FORK: cannot stat %s: %v", postForkConfigPath, err)
-	}
-	if !configInfo.Mode().IsRegular() {
-		return fmt.Errorf("GENESIS_LEDGER_FILE_POST_FORK: %s is not a regular file", postForkConfigPath)
-	}
-	return nil
 }
 
 var validStorageOptions = map[string]bool{
@@ -249,19 +182,13 @@ type PostgreSQLConfig struct {
 }
 
 type AppConfig struct {
-	NetworkName             string `json:"network_name"`
-	DelegationVerifyBinPath string `json:"delegation_verify_bin_path"`
-	NoChecks                bool   `json:"no_checks"`
-	TolerateSokMismatch     bool   `json:"tolerate_sok_mismatch"`
-	GenesisLedgerFile       string `json:"genesis_ledger_file"`
-	// ForkCutoverTime enables dual-verifier mode when set: submissions with
-	// submitted_at >= ForkCutoverTime are verified with the post-fork binary,
-	// all others with the (pre-fork) DelegationVerifyBinPath.
-	ForkCutoverTime                 *time.Time        `json:"fork_cutover_time,omitempty"`
-	DelegationVerifyBinPathPostFork string            `json:"delegation_verify_bin_path_post_fork,omitempty"`
-	GenesisLedgerFilePostFork       string            `json:"genesis_ledger_file_post_fork,omitempty"`
-	SubmissionStorage               string            `json:"submission_storage"`
-	AwsConfig                       *AwsConfig        `json:"aws"`
-	CassandraConfig                 *CassandraConfig  `json:"cassandra_config,omitempty"`
-	PostgreSQLConfig                *PostgreSQLConfig `json:"postgres_config,omitempty"`
+	NetworkName             string            `json:"network_name"`
+	DelegationVerifyBinPath string            `json:"delegation_verify_bin_path"`
+	NoChecks                bool              `json:"no_checks"`
+	TolerateSokMismatch     bool              `json:"tolerate_sok_mismatch"`
+	GenesisLedgerFile       string            `json:"genesis_ledger_file"`
+	SubmissionStorage       string            `json:"submission_storage"`
+	AwsConfig               *AwsConfig        `json:"aws"`
+	CassandraConfig         *CassandraConfig  `json:"cassandra_config,omitempty"`
+	PostgreSQLConfig        *PostgreSQLConfig `json:"postgres_config,omitempty"`
 }

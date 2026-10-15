@@ -3,8 +3,8 @@
 # - submission_updater: built here from src/ (static Go binary)
 # - delegation-verify and the network config: released Mina debs from the signed apt repo
 #
-# One post-fork (Mesa) verifier only: this image cannot verify pre-fork submissions.
-# Do not re-run windows before the 2026-09-03T18:00Z cutover with it.
+# The verifier only handles submissions from its release's chain. For mainnet 4.x that is
+# Mesa: do not re-run windows before the 2026-09-03T18:00Z hard fork with this image.
 #################################################################################################
 
 FROM golang:1.22-bookworm AS go
@@ -71,11 +71,5 @@ ENV MINA_PROFILE=${MINA_PROFILE}
 ENV SSL_CERTFILE=/root/.cassandra/sf-class2-root.crt
 ENV DELEGATION_VERIFY_BIN_PATH=/usr/local/bin/mina-delegation-verify
 ENV GENESIS_LEDGER_FILE=/var/lib/coda/${MINA_NETWORK}.json
-# One binary serves both partitions, so deployments that still set FORK_CUTOVER_TIME
-# keep passing the startup checks. With FORK_CUTOVER_TIME set, pre-cutover submissions
-# go to this Mesa verifier too and are stored as failed. Real dual-binary routing needs
-# a pre-fork binary and config mounted in and these two variables pointed at them.
-ENV DELEGATION_VERIFY_BIN_PATH_POST_FORK=/usr/local/bin/mina-delegation-verify
-ENV GENESIS_LEDGER_FILE_POST_FORK=/var/lib/coda/${MINA_NETWORK}.json
 
 ENTRYPOINT ["submission_updater"]
