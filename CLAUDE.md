@@ -52,7 +52,7 @@ make tidy           # Run go mod tidy in src directory
 TAG=1.0 make docker-standalone
 
 # With stateless verifier binary included
-TAG=1.0 DUNE_PROFILE=devnet MINA_BRANCH=delegation_verify_over_stdin_rc_base make docker-delegation-verify
+TAG=1.0 MINA_VERSION=4.0.2-84b8d96 LEDGER_CONFIG_VERSION=4.0.0-6850301 make docker-delegation-verify
 
 # Custom image names (defaults to ghcr.io/o1-labs/submission-updater)
 IMAGE_NAME=custom-registry/my-image TAG=1.0 make docker-standalone
@@ -109,6 +109,6 @@ cd src && go test -run TestFunctionName
 The project supports two Docker configurations:
 
 1. **Standalone**: Only submission-updater binary, requires external stateless verifier
-2. **Delegation-verify**: Includes both submission-updater and stateless verifier built from Mina source
+2. **Delegation-verify**: submission-updater plus the stateless verifier and network config installed from released Mina debs (stable apt repo)
 
-The delegation-verify image is used in production and requires specifying the Mina branch and Dune profile for building the stateless verifier.
+The delegation-verify image is used in production and requires `MINA_VERSION` (Mina release deb version). See the Docker section of README.md.

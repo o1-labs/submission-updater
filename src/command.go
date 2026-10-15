@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -92,46 +91,11 @@ func (ctx *AppContext) runVerifyPass(cmd, command, input string) ([]Submission, 
 	return submissions, nil
 }
 
-// verifySubmissions is the single entry point for verification: it routes the
-// batch through the delegation-verify binary - or, in dual-verifier mode, the
-// pre- and post-fork binaries by submitted_at timestamp - and returns whatever
-// verified. In dual mode a failing partition does not discard the other
-// partition's completed work: successes are accumulated and returned alongside
-// the joined error, so the caller can bank what verified before failing the run.
+// verifySubmissions runs the batch through the delegation-verify binary and
+// returns whatever verified.
 func (ctx *AppContext) verifySubmissions(submissions []Submission) ([]Submission, error) {
 	cfg := ctx.AppConfig
-	if cfg.ForkCutoverTime == nil {
-		return ctx.verifyBatch(submissions, cfg.DelegationVerifyBinPath, cfg.GenesisLedgerFile)
-	}
-
-	preFork, postFork := partitionSubmissionsByCutover(submissions, *cfg.ForkCutoverTime)
-	ctx.Log.Infof("Dual-verifier mode (cutover %v): %v pre-fork submissions, %v post-fork submissions",
-		cfg.ForkCutoverTime.Format(time.RFC3339), len(preFork), len(postFork))
-
-	var verifiedSubmissions []Submission
-	var errs []error
-	if len(preFork) > 0 {
-		verified, err := ctx.verifyBatch(preFork, cfg.DelegationVerifyBinPath, cfg.GenesisLedgerFile)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("pre-fork: %w", err))
-		} else {
-			verifiedSubmissions = append(verifiedSubmissions, verified...)
-		}
-	} else {
-		ctx.Log.Info("No pre-fork submissions, skipping pre-fork verification run")
-	}
-	if len(postFork) > 0 {
-		verified, err := ctx.verifyBatch(postFork, cfg.DelegationVerifyBinPathPostFork, cfg.GenesisLedgerFilePostFork)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("post-fork: %w", err))
-		} else {
-			verifiedSubmissions = append(verifiedSubmissions, verified...)
-		}
-	} else {
-		ctx.Log.Info("No post-fork submissions, skipping post-fork verification run")
-	}
-
-	return verifiedSubmissions, errors.Join(errs...)
+	return ctx.verifyBatch(submissions, cfg.DelegationVerifyBinPath, cfg.GenesisLedgerFile)
 }
 
 // verifyBatch marshals the given submissions and runs them through the
@@ -144,60 +108,22 @@ func (ctx *AppContext) verifyBatch(submissions []Submission, binPath, configFile
 	return ctx.runDelegationVerifyCommand(binPath, configFile, string(submissionsJSON))
 }
 
-// partitionSubmissionsByCutover splits submissions into pre-fork (submitted_at
-// before the cutover) and post-fork (submitted_at at or after the cutover).
-func partitionSubmissionsByCutover(submissions []Submission, cutover time.Time) (preFork, postFork []Submission) {
-	for _, submission := range submissions {
-		if submission.SubmittedAt.Before(cutover) {
-			preFork = append(preFork, submission)
-		} else {
-			postFork = append(postFork, submission)
-		}
-	}
-	return preFork, postFork
-}
-
-// sokMismatchErrors are the verifier's messages for a snark-work sok-digest
-// mismatch. There are two spellings because the check lives in a different
-// place in each era, and a deployment spanning the hard fork sees both:
-//
-//   - Pre-fork binaries (Berkeley, and the 3.5.0 mainnet stop-slot release)
-//     do the comparison inside Transaction_snark.verify, which reports
-//     "Transaction_snark.verify: Mismatched sok_message" - underscored, and
-//     with no "digest" in it.
-//   - Post-fork binaries (4.0.0 Mesa) moved it to an explicit check in
-//     delegation_verify.ml, which reports "proof's sok message digest does
-//     not match the sok message".
-//
-// Matching only the post-fork wording would leave the waiver inert against
-// everything failing on mainnet today, and would still miss the pre-fork
-// partition after the fork.
+// sokMismatchError is the verifier's message for a snark-work sok-digest
+// mismatch (explicit check in delegation_verify.ml).
 //
 // Daemons from 3.4.0 onward route uptime snark work through the zkApp-segment
 // path that stamps the default sok digest into the statement
-// (MinaProtocol/mina#19299); mainnet block producers are on 3.5.0 for the
-// stop slot, so the defect is live pre-fork as well. The binding prevents
-// fee/prover misattribution in the snark pool, where work is paid; uptime
-// snark work is never pooled or paid, so the mismatch can be waived via
-// TOLERATE_SOK_MISMATCH until the daemon fix (MinaProtocol/mina#19313) is
-// deployed fleet-wide.
-var sokMismatchErrors = []string{
-	// post-fork: delegation_verify's explicit check
-	"sok message digest does not match the sok message",
-	// pre-fork: Transaction_snark.verify's internal check
-	"Mismatched sok_message",
-}
+// (MinaProtocol/mina#19299). The binding prevents fee/prover misattribution in
+// the snark pool, where work is paid; uptime snark work is never pooled or
+// paid, so the mismatch can be waived via TOLERATE_SOK_MISMATCH until the
+// daemon fix (MinaProtocol/mina#19313) is deployed fleet-wide.
+const sokMismatchError = "sok message digest does not match the sok message"
 
 // isSokMismatch reports whether a validation error is a snark-work sok-digest
-// mismatch in either era's wording. The match is on a substring: the verifier
-// prefixes and decorates these messages with context.
+// mismatch. The match is on a substring: the verifier prefixes and decorates
+// the message with context.
 func isSokMismatch(validationError string) bool {
-	for _, candidate := range sokMismatchErrors {
-		if strings.Contains(validationError, candidate) {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(validationError, sokMismatchError)
 }
 
 // submissionKey identifies a submission across the verifier round trip. The
