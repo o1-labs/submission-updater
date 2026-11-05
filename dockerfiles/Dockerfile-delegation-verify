@@ -21,7 +21,10 @@ FROM debian:bookworm-slim
 ARG MINA_VERSION
 ARG MINA_NETWORK=mainnet
 ARG MINA_PROFILE=${MINA_NETWORK}
-# Version of mina-${MINA_NETWORK}-config that ships the ledger tarballs. Empty = MINA_VERSION.
+# Version of mina-${MINA_NETWORK}-config to install. Empty = MINA_VERSION. Set it when the
+# verifier is released on its own, so no config deb exists at MINA_VERSION.
+ARG MINA_CONFIG_VERSION=""
+# Version of mina-${MINA_NETWORK}-config that ships the ledger tarballs. Empty = the installed config.
 # Config debs carry the tarballs from MinaProtocol/mina#19737 on; 4.0.1 and 4.0.2 do not,
 # so for those point this at 4.0.0-6850301 (same mainnet ledgers).
 ARG LEDGER_CONFIG_VERSION=""
@@ -48,8 +51,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          "mina-delegation-verify=${MINA_VERSION}" \
          "mina-logproc=${MINA_VERSION}" \
-         "mina-${MINA_NETWORK}-config=${MINA_VERSION}" \
-    && if [[ -n "${LEDGER_CONFIG_VERSION}" && "${LEDGER_CONFIG_VERSION}" != "${MINA_VERSION}" ]]; then \
+         "mina-${MINA_NETWORK}-config=${MINA_CONFIG_VERSION:-${MINA_VERSION}}" \
+    && if [[ -n "${LEDGER_CONFIG_VERSION}" && "${LEDGER_CONFIG_VERSION}" != "${MINA_CONFIG_VERSION:-${MINA_VERSION}}" ]]; then \
          cd /tmp \
          && apt-get download "mina-${MINA_NETWORK}-config=${LEDGER_CONFIG_VERSION}" \
          && dpkg-deb --fsys-tarfile mina-"${MINA_NETWORK}"-config_*.deb \
