@@ -25,6 +25,7 @@ case "$1" in
       --build-arg "MINA_VERSION=$MINA_VERSION" \
       --build-arg "MINA_NETWORK=${MINA_NETWORK:-mainnet}" \
       --build-arg "MINA_PROFILE=${MINA_PROFILE:-${MINA_NETWORK:-mainnet}}" \
+      --build-arg "MINA_CONFIG_VERSION=${MINA_CONFIG_VERSION:-}" \
       --build-arg "LEDGER_CONFIG_VERSION=${LEDGER_CONFIG_VERSION:-}" \
       -f dockerfiles/Dockerfile-delegation-verify -t "$IMAGE_NAME:$TAG" .
     ;;

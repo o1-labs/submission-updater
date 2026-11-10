@@ -73,10 +73,11 @@ $ ./result/bin/cassandra-updater "2024-03-04 09:38:54.0+0000" "2024-03-04 09:45:
 
 Build args (env variables of `make docker-delegation-verify`):
 
- - `MINA_VERSION` - required. Deb version of the Mina release, e.g. `4.0.2-84b8d96`. Installs `mina-delegation-verify` and `mina-<network>-config` at that version.
+ - `MINA_VERSION` - required. Deb version of the Mina release, e.g. `4.0.2-84b8d96`. Installs `mina-delegation-verify` and `mina-logproc` at that version.
  - `MINA_NETWORK` - default `mainnet`. Selects `mina-<network>-config`.
  - `MINA_PROFILE` - default `MINA_NETWORK`. The verifier deb is profile-generic and reads it at run time.
- - `LEDGER_CONFIG_VERSION` - default `MINA_VERSION`. Version of `mina-<network>-config` that ships the ledger tarballs. Config debs carry them from MinaProtocol/mina#19737 on. For 4.0.1 and 4.0.2 use `4.0.0-6850301`, which has the same mainnet ledgers.
+ - `MINA_CONFIG_VERSION` - default `MINA_VERSION`. Version of `mina-<network>-config` to install. Set it when the verifier is released on its own, so no config deb exists at `MINA_VERSION`, e.g. `MINA_VERSION=4.0.4-c00c297` with `MINA_CONFIG_VERSION=4.0.4-c9e2eac`. The config deb has no dependencies, so it does not install the daemon.
+ - `LEDGER_CONFIG_VERSION` - default: the installed config. Version of `mina-<network>-config` that ships the ledger tarballs. Config debs carry them from MinaProtocol/mina#19737 on. For 4.0.1 and 4.0.2 use `4.0.0-6850301`, which has the same mainnet ledgers.
 
 The verifier looks for the genesis and epoch ledgers under `/var/lib/coda` first and downloads them from S3 otherwise; files found locally are not hash-checked. The build therefore fails unless every `s3_data_hash` in `/var/lib/coda/<network>.json` matches a tarball in `/var/lib/coda` (`scripts/check-ledgers.sh`, tested by `scripts/test-check-ledgers.sh`).
 
@@ -98,7 +99,7 @@ $ TAG=4.0.2 \
   make docker-delegation-verify
 ```
 
-The same args are the `mina_version`, `mina_network` and `ledger_config_version` inputs of the Publish workflow.
+The same args are the `mina_version`, `mina_network`, `mina_config_version` and `ledger_config_version` inputs of the Publish workflow.
 
 **Run**:
 
